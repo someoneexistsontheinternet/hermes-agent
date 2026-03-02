@@ -52,6 +52,8 @@ _HERMES_CORE_TOOLS = [
     "todo", "memory",
     # Session history search
     "session_search",
+    # Discord archive search
+    "discord_search",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -167,6 +169,12 @@ TOOLSETS = {
     "session_search": {
         "description": "Search and recall past conversations with summarization",
         "tools": ["session_search"],
+        "includes": []
+    },
+
+    "discord_search": {
+        "description": "Search local Discord channel archive with FTS5",
+        "tools": ["discord_search"],
         "includes": []
     },
     

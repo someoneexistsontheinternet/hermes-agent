@@ -289,6 +289,20 @@ class MessageEvent:
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
+    # Optional platform-provided context block to inject into the prompt.
+    # Used for channel-scoped rolling history (e.g., recent Discord chatter).
+    extra_context: str = ""
+
+    # Optional prior image references for follow-up text turns.
+    # Platforms can populate this so multimodal-capable models can still
+    # "see" the most recent relevant user image without extra tool calls.
+    carryover_image_items: List[Dict[str, str]] = field(default_factory=list)
+
+    # Optional reset hint for gateway session manager.
+    # Platforms can request a "soft auto-reset" before processing this turn.
+    force_auto_reset: bool = False
+    auto_reset_reason: str = ""
+    
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
         return self.text.startswith("/")

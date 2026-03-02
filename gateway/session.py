@@ -341,7 +341,12 @@ class SessionStore:
         else:
             return f"agent:main:{platform}:{source.chat_type}:{source.chat_id}"
     
-    def _should_reset(self, entry: SessionEntry, source: SessionSource) -> bool:
+    def _should_reset(
+        self,
+        entry: SessionEntry,
+        source: SessionSource,
+        force_auto_reset: bool = False,
+    ) -> bool:
         """
         Check if a session should be reset based on policy.
         
@@ -351,6 +356,9 @@ class SessionStore:
             session_key = self._generate_session_key(source)
             if self._has_active_processes_fn(session_key):
                 return False
+
+        if force_auto_reset:
+            return True
 
         policy = self.config.get_reset_policy(
             platform=source.platform,
@@ -390,7 +398,8 @@ class SessionStore:
     def get_or_create_session(
         self, 
         source: SessionSource,
-        force_new: bool = False
+        force_new: bool = False,
+        force_auto_reset: bool = False,
     ) -> SessionEntry:
         """
         Get an existing session or create a new one.
@@ -406,7 +415,7 @@ class SessionStore:
         if session_key in self._entries and not force_new:
             entry = self._entries[session_key]
             
-            if not self._should_reset(entry, source):
+            if not self._should_reset(entry, source, force_auto_reset=force_auto_reset):
                 entry.updated_at = now
                 self._save()
                 return entry
@@ -545,6 +554,22 @@ class SessionStore:
     def get_transcript_path(self, session_id: str) -> Path:
         """Get the path to a session's legacy transcript file."""
         return self.sessions_dir / f"{session_id}.jsonl"
+
+    def _legacy_transcript_paths(self, session_id: str) -> List[Path]:
+        """
+        Candidate legacy JSONL transcript paths for this session.
+
+        Compatibility note:
+        - Newer runs may use HERMES_HOME/sessions.
+        - Older runs wrote to ~/.hermes/sessions regardless of HERMES_HOME.
+        """
+        primary = self.get_transcript_path(session_id)
+        fallback = Path.home() / ".hermes" / "sessions" / f"{session_id}.jsonl"
+        paths: List[Path] = []
+        for p in (primary, fallback):
+            if p not in paths:
+                paths.append(p)
+        return paths
     
     def append_to_transcript(self, session_id: str, message: Dict[str, Any]) -> None:
         """Append a message to a session's transcript (SQLite + legacy JSONL)."""
@@ -564,8 +589,46 @@ class SessionStore:
         
         # Also write legacy JSONL (keeps existing tooling working during transition)
         transcript_path = self.get_transcript_path(session_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
         with open(transcript_path, "a") as f:
             f.write(json.dumps(message, ensure_ascii=False) + "\n")
+
+    def _load_legacy_transcript(self, session_id: str) -> List[Dict[str, Any]]:
+        """Load transcript rows from legacy JSONL storage."""
+        best_messages: List[Dict[str, Any]] = []
+        best_score = (-1, -1)  # (has_user, message_count)
+        best_path: Optional[Path] = None
+
+        for transcript_path in self._legacy_transcript_paths(session_id):
+            if not transcript_path.exists():
+                continue
+
+            messages: List[Dict[str, Any]] = []
+            with open(transcript_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            messages.append(json.loads(line))
+                        except Exception:
+                            # Keep going if one legacy line is corrupted.
+                            continue
+
+            has_user = 1 if any(m.get("role") == "user" for m in messages) else 0
+            score = (has_user, len(messages))
+            if score > best_score:
+                best_score = score
+                best_messages = messages
+                best_path = transcript_path
+
+        if best_path and best_path != self.get_transcript_path(session_id):
+            logger.debug(
+                "Using fallback legacy transcript path for %s: %s",
+                session_id,
+                best_path,
+            )
+
+        return best_messages
     
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""
@@ -574,24 +637,23 @@ class SessionStore:
             try:
                 messages = self._db.get_messages_as_conversation(session_id)
                 if messages:
+                    # Recovery fallback:
+                    # Older DB rows may miss multimodal user turns when content
+                    # wasn't SQLite-serializable. If that happens and legacy
+                    # JSONL has richer data, prefer the legacy transcript.
+                    db_has_user = any(m.get("role") == "user" for m in messages)
+                    if db_has_user:
+                        return messages
+
+                    legacy_messages = self._load_legacy_transcript(session_id)
+                    if any(m.get("role") == "user" for m in legacy_messages):
+                        return legacy_messages
                     return messages
             except Exception as e:
                 logger.debug("Could not load messages from DB: %s", e)
         
         # Fall back to legacy JSONL
-        transcript_path = self.get_transcript_path(session_id)
-        
-        if not transcript_path.exists():
-            return []
-        
-        messages = []
-        with open(transcript_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    messages.append(json.loads(line))
-        
-        return messages
+        return self._load_legacy_transcript(session_id)
 
 
 def build_session_context(

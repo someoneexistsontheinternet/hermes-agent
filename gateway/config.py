@@ -19,6 +19,19 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 
+def _default_hermes_home() -> Path:
+    """Resolve Hermes home directory, honoring HERMES_HOME when set."""
+    hermes_home = (os.getenv("HERMES_HOME", "") or "").strip()
+    if hermes_home:
+        return Path(hermes_home).expanduser()
+    return Path.home() / ".hermes"
+
+
+def _default_sessions_dir() -> Path:
+    """Default session transcript directory, honoring HERMES_HOME when set."""
+    return _default_hermes_home() / "sessions"
+
+
 class Platform(Enum):
     """Supported messaging platforms."""
     LOCAL = "local"
@@ -145,7 +158,7 @@ class GatewayConfig:
     reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
     
     # Storage paths
-    sessions_dir: Path = field(default_factory=lambda: Path.home() / ".hermes" / "sessions")
+    sessions_dir: Path = field(default_factory=_default_sessions_dir)
     
     # Delivery settings
     always_log_local: bool = True  # Always save cron outputs to local files
@@ -228,7 +241,7 @@ class GatewayConfig:
         if "default_reset_policy" in data:
             default_policy = SessionResetPolicy.from_dict(data["default_reset_policy"])
         
-        sessions_dir = Path.home() / ".hermes" / "sessions"
+        sessions_dir = _default_sessions_dir()
         if "sessions_dir" in data:
             sessions_dir = Path(data["sessions_dir"])
         
@@ -256,7 +269,7 @@ def load_gateway_config() -> GatewayConfig:
     config = GatewayConfig()
     
     # Try loading from ~/.hermes/gateway.json
-    gateway_config_path = Path.home() / ".hermes" / "gateway.json"
+    gateway_config_path = _default_hermes_home() / "gateway.json"
     if gateway_config_path.exists():
         try:
             with open(gateway_config_path, "r") as f:
@@ -265,18 +278,52 @@ def load_gateway_config() -> GatewayConfig:
         except Exception as e:
             print(f"[gateway] Warning: Failed to load {gateway_config_path}: {e}")
     
-    # Bridge session_reset from config.yaml (the user-facing config file)
-    # into the gateway config. config.yaml takes precedence over gateway.json
-    # for session reset policy since that's where hermes setup writes it.
+    # Bridge user-facing config.yaml values into gateway config.
+    # config.yaml takes precedence over gateway.json for these settings.
     try:
         import yaml
-        config_yaml_path = Path.home() / ".hermes" / "config.yaml"
+        config_yaml_path = _default_hermes_home() / "config.yaml"
         if config_yaml_path.exists():
             with open(config_yaml_path) as f:
                 yaml_cfg = yaml.safe_load(f) or {}
             sr = yaml_cfg.get("session_reset")
             if sr and isinstance(sr, dict):
                 config.default_reset_policy = SessionResetPolicy.from_dict(sr)
+            gateway_cfg = yaml_cfg.get("gateway")
+            if gateway_cfg and isinstance(gateway_cfg, dict):
+                discord_cfg = gateway_cfg.get("discord")
+                if discord_cfg and isinstance(discord_cfg, dict):
+                    if Platform.DISCORD not in config.platforms:
+                        config.platforms[Platform.DISCORD] = PlatformConfig()
+                    extra = config.platforms[Platform.DISCORD].extra
+                    if not isinstance(extra, dict):
+                        extra = {}
+                        config.platforms[Platform.DISCORD].extra = extra
+                    discord_keys = (
+                        "enable_dms",
+                        "context_max_chars",
+                        "fresh_context_limit",
+                        "delta_reset_threshold",
+                        "context_empty_delta_fallback",
+                        "archive_enabled",
+                        "archive_db_path",
+                        "allowed_guild_ids",
+                        "allowed_channel_ids",
+                        "full_scrape_enabled",
+                        "full_scrape_interval_sec",
+                        "full_scrape_max_channels_per_tick",
+                        "full_scrape_max_pages_per_channel",
+                        "full_scrape_seed_limit",
+                        "full_scrape_include_threads",
+                        "backfill_enabled",
+                        "backfill_interval_sec",
+                        "backfill_max_channels_per_tick",
+                        "backfill_max_pages_per_channel",
+                        "scrape_progress_every_pages",
+                    )
+                    for key in discord_keys:
+                        if key in discord_cfg:
+                            extra[key] = discord_cfg[key]
     except Exception:
         pass
 
@@ -396,7 +443,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
 
 def save_gateway_config(config: GatewayConfig) -> None:
     """Save gateway configuration to ~/.hermes/gateway.json."""
-    gateway_config_path = Path.home() / ".hermes" / "gateway.json"
+    gateway_config_path = _default_hermes_home() / "gateway.json"
     gateway_config_path.parent.mkdir(parents=True, exist_ok=True)
     
     with open(gateway_config_path, "w") as f:

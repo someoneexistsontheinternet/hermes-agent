@@ -214,6 +214,43 @@ session_reset:
   at_hour: 4           # Daily reset hour, 0-23 local time (default: 4 AM)
 
 # =============================================================================
+# Gateway Platform Context Windows (Messaging)
+# =============================================================================
+# Platform-specific context windows injected before each agent reply.
+# Useful for lightweight "ambient memory" from recent channel chatter.
+#
+gateway:
+  discord:
+    # Fresh window size for new/restarted channel sessions.
+    # Used when no prior turn anchor exists or delta_reset_threshold is exceeded.
+    # Clamped to [1, 200].
+    fresh_context_limit: 20
+
+    # If non-bot message delta since the last Hermes turn exceeds this,
+    # gateway forces an auto-reset for that channel session and starts fresh.
+    # This value is also the max follow-up delta payload size per turn.
+    # Clamped to [1, 500].
+    delta_reset_threshold: 50
+
+    # When true, follow-up turns with empty delta will fall back to fresh last-N.
+    # Default behavior is false (delta-only follow-ups).
+    context_empty_delta_fallback: false
+
+    # Max characters allowed for the injected context block.
+    # Clamped to [2000, 80000].
+    context_max_chars: 14000
+
+    # Local Discord archive (SQLite + FTS5) settings.
+    archive_enabled: true
+    archive_db_path: "~/.hermes/discord_data.sqlite"
+
+    # Optional hard scoping for where the Discord bot is allowed to operate.
+    # Leave empty to allow all guilds/channels the bot can access.
+    # You can set either or both.
+    allowed_guild_ids: []
+    allowed_channel_ids: []
+
+# =============================================================================
 # Skills Configuration
 # =============================================================================
 # Skills are reusable procedures the agent can load and follow. The agent can

@@ -11,6 +11,8 @@ Hermes Agent is an AI agent harness with tool-calling capabilities, interactive 
 source venv/bin/activate  # Before running any Python commands
 ```
 
+The environment is at ./hermes-agent/venv
+
 ## Project Structure
 
 ```
@@ -222,6 +224,7 @@ The unified `hermes` command provides all functionality:
 | `hermes uninstall` | Uninstall (can keep configs for reinstall) |
 | `hermes gateway` | Start gateway (messaging + cron scheduler) |
 | `hermes gateway install` | Install gateway as system service |
+| `hermes gateway restart` | Restart the gateway |
 | `hermes cron list` | View scheduled jobs |
 | `hermes cron status` | Check if cron scheduler is running |
 | `hermes version` | Show version info |

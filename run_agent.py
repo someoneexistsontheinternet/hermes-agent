@@ -121,6 +121,7 @@ class AIAgent:
         providers_ignored: List[str] = None,
         providers_order: List[str] = None,
         provider_sort: str = None,
+        model_extra_body: Dict[str, Any] = None,
         session_id: str = None,
         tool_progress_callback: callable = None,
         clarify_callback: callable = None,
@@ -132,6 +133,7 @@ class AIAgent:
         skip_memory: bool = False,
         session_db=None,
         honcho_session_key: str = None,
+        session_db_writes: bool = True,
     ):
         """
         Initialize the AI Agent.
@@ -154,6 +156,8 @@ class AIAgent:
             providers_ignored (List[str]): OpenRouter providers to ignore (optional)
             providers_order (List[str]): OpenRouter providers to try in order (optional)
             provider_sort (str): Sort providers by price/throughput/latency (optional)
+            model_extra_body (Dict): Extra request body keys merged into chat completions calls.
+                Useful for OpenRouter-compatible options such as custom reasoning/provider params.
             session_id (str): Pre-generated session ID for logging (optional, auto-generated if not provided)
             tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
             clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
@@ -171,6 +175,9 @@ class AIAgent:
                 polluting trajectories with user-specific persona or project instructions.
             honcho_session_key (str): Session key for Honcho integration (e.g., "telegram:123456" or CLI session_id).
                 When provided and Honcho is enabled in config, enables persistent cross-session user modeling.
+            session_db_writes (bool): If False, disables message writes from AIAgent to SessionDB.
+                Useful when an outer runtime (for example the gateway SessionStore) is the
+                single source of transcript persistence.
         """
         self.model = model
         self.max_iterations = max_iterations
@@ -210,6 +217,7 @@ class AIAgent:
         self.providers_ignored = providers_ignored
         self.providers_order = providers_order
         self.provider_sort = provider_sort
+        self.model_extra_body = copy.deepcopy(model_extra_body) if isinstance(model_extra_body, dict) else None
 
         # Store toolset filtering options
         self.enabled_toolsets = enabled_toolsets
@@ -384,6 +392,7 @@ class AIAgent:
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
+        self._session_db_writes = bool(session_db_writes)
         if self._session_db:
             try:
                 self._session_db.create_session(
@@ -531,6 +540,10 @@ class AIAgent:
         if not content:
             return False
         
+        # Normalize legacy scratchpad tags so the visibility check treats
+        # them exactly like <think> blocks.
+        content = convert_scratchpad_to_think(content)
+        
         # Remove all <think>...</think> blocks (including nested ones, non-greedy)
         cleaned = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
         
@@ -541,6 +554,7 @@ class AIAgent:
         """Remove <think>...</think> blocks from content, returning only visible text."""
         if not content:
             return ""
+        content = convert_scratchpad_to_think(content)
         return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
     
     
@@ -607,15 +621,16 @@ class AIAgent:
         """
         self._session_messages = messages
         self._save_session_log(messages)
-        self._flush_messages_to_session_db(messages, conversation_history)
+        if self._session_db_writes:
+            self._flush_messages_to_session_db(messages, conversation_history)
 
     def _log_msg_to_db(self, msg: Dict):
         """Log a single message to SQLite immediately. Called after each messages.append()."""
-        if not self._session_db:
+        if not self._session_db or not self._session_db_writes:
             return
         try:
             role = msg.get("role", "unknown")
-            content = msg.get("content")
+            content = self._serialize_message_content_for_storage(msg.get("content"))
             tool_calls_data = None
             if hasattr(msg, "tool_calls") and msg.tool_calls:
                 tool_calls_data = [
@@ -643,13 +658,13 @@ class AIAgent:
         return path so that tool calls, tool responses, and assistant messages
         are never lost even when the conversation errors out.
         """
-        if not self._session_db:
+        if not self._session_db or not self._session_db_writes:
             return
         try:
             start_idx = len(conversation_history) if conversation_history else 0
             for msg in messages[start_idx:]:
                 role = msg.get("role", "unknown")
-                content = msg.get("content")
+                content = self._serialize_message_content_for_storage(msg.get("content"))
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     tool_calls_data = [
@@ -876,7 +891,7 @@ class AIAgent:
             elif msg["role"] == "user":
                 trajectory.append({
                     "from": "human",
-                    "value": msg["content"]
+                    "value": self._content_to_text(msg.get("content"))
                 })
             
             i += 1
@@ -996,6 +1011,45 @@ class AIAgent:
         content = re.sub(r'\n+(<think>)', r'\n\1', content)
         content = re.sub(r'(</think>)\n+', r'\1\n', content)
         return content.strip()
+
+    @staticmethod
+    def _serialize_message_content_for_storage(content: Any) -> Optional[str]:
+        """Serialize non-string message content so SQLite logging does not fail."""
+        if content is None or isinstance(content, str):
+            return content
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except Exception:
+            return str(content)
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        """Project OpenAI-style content parts into compact plain text."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            chunks: List[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "text":
+                    text = str(part.get("text", "") or "").strip()
+                    if text:
+                        chunks.append(text)
+                elif ptype == "image_url":
+                    chunks.append("[image]")
+            return "\n".join(chunks).strip()
+        return str(content or "")
+
+    @staticmethod
+    def _append_text_to_user_content(content: Any, note: str) -> Any:
+        """Append a text note while preserving multimodal content-part structure."""
+        if isinstance(content, list):
+            updated = list(content)
+            updated.append({"type": "text", "text": note})
+            return updated
+        return f"{content or ''}{note}"
 
     def _save_session_log(self, messages: List[Dict[str, Any]] = None):
         """
@@ -1294,8 +1348,8 @@ class AIAgent:
             raise result["error"]
         return result["response"]
 
-    def _build_api_kwargs(self, api_messages: list) -> dict:
-        """Build the keyword arguments dict for the chat completions API call."""
+    def _compose_extra_body(self, include_provider_preferences: bool = True) -> dict:
+        """Build extra_body for OpenAI-compatible chat.completions calls."""
         provider_preferences = {}
         if self.providers_allowed:
             provider_preferences["only"] = self.providers_allowed
@@ -1306,6 +1360,44 @@ class AIAgent:
         if self.provider_sort:
             provider_preferences["sort"] = self.provider_sort
 
+        extra_body = copy.deepcopy(self.model_extra_body) if self.model_extra_body else {}
+
+        if include_provider_preferences and provider_preferences:
+            existing_provider = extra_body.get("provider")
+            if isinstance(existing_provider, dict):
+                merged_provider = existing_provider.copy()
+                merged_provider.update(provider_preferences)
+                extra_body["provider"] = merged_provider
+            else:
+                extra_body["provider"] = provider_preferences
+
+        _is_openrouter = "openrouter" in self.base_url.lower()
+        _is_nous = "nousresearch" in self.base_url.lower()
+
+        if _is_openrouter or _is_nous:
+            if self.reasoning_config is not None:
+                extra_body["reasoning"] = self.reasoning_config
+            elif "reasoning" not in extra_body:
+                extra_body["reasoning"] = {
+                    "enabled": True,
+                    "effort": "xhigh"
+                }
+
+        # Nous Portal product attribution
+        if _is_nous:
+            existing_tags = extra_body.get("tags")
+            if isinstance(existing_tags, list):
+                if "product=hermes-agent" not in existing_tags:
+                    extra_body["tags"] = existing_tags + ["product=hermes-agent"]
+            else:
+                extra_body["tags"] = ["product=hermes-agent"]
+
+        return extra_body
+
+    def _build_api_kwargs(self, api_messages: list) -> dict:
+        """Build the keyword arguments dict for the chat completions API call."""
+        extra_body = self._compose_extra_body(include_provider_preferences=True)
+
         api_kwargs = {
             "model": self.model,
             "messages": api_messages,
@@ -1315,27 +1407,6 @@ class AIAgent:
 
         if self.max_tokens is not None:
             api_kwargs.update(self._max_tokens_param(self.max_tokens))
-
-        extra_body = {}
-
-        if provider_preferences:
-            extra_body["provider"] = provider_preferences
-
-        _is_openrouter = "openrouter" in self.base_url.lower()
-        _is_nous = "nousresearch" in self.base_url.lower()
-
-        if _is_openrouter or _is_nous:
-            if self.reasoning_config is not None:
-                extra_body["reasoning"] = self.reasoning_config
-            else:
-                extra_body["reasoning"] = {
-                    "enabled": True,
-                    "effort": "xhigh"
-                }
-
-        # Nous Portal product attribution
-        if _is_nous:
-            extra_body["tags"] = ["product=hermes-agent"]
 
         if extra_body:
             api_kwargs["extra_body"] = extra_body
@@ -1771,19 +1842,7 @@ class AIAgent:
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
 
-            summary_extra_body = {}
-            _is_openrouter = "openrouter" in self.base_url.lower()
-            _is_nous = "nousresearch" in self.base_url.lower()
-            if _is_openrouter or _is_nous:
-                if self.reasoning_config is not None:
-                    summary_extra_body["reasoning"] = self.reasoning_config
-                else:
-                    summary_extra_body["reasoning"] = {
-                        "enabled": True,
-                        "effort": "xhigh"
-                    }
-            if _is_nous:
-                summary_extra_body["tags"] = ["product=hermes-agent"]
+            summary_extra_body = self._compose_extra_body(include_provider_preferences=True)
 
             summary_kwargs = {
                 "model": self.model,
@@ -1798,8 +1857,7 @@ class AIAgent:
 
             if summary_response.choices and summary_response.choices[0].message.content:
                 final_response = summary_response.choices[0].message.content
-                if "<think>" in final_response:
-                    final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
+                final_response = self._strip_think_blocks(final_response).strip()
                 messages.append({"role": "assistant", "content": final_response})
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
@@ -1812,7 +1870,7 @@ class AIAgent:
 
     def run_conversation(
         self,
-        user_message: str,
+        user_message: Any,
         system_message: str = None,
         conversation_history: List[Dict[str, Any]] = None,
         task_id: str = None
@@ -1821,7 +1879,8 @@ class AIAgent:
         Run a complete conversation with tool calling until completion.
 
         Args:
-            user_message (str): The user's message/question
+            user_message (Any): The user's message/question. May be a plain
+                string or an OpenAI-style list of multimodal content parts.
             system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
             conversation_history (List[Dict]): Previous conversation messages (optional)
             task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
@@ -1859,7 +1918,7 @@ class AIAgent:
 
         # Preserve the original user message before nudge injection.
         # Honcho should receive the actual user input, not system nudges.
-        original_user_message = user_message
+        original_user_message = self._content_to_text(user_message)
 
         # Periodic memory nudge: remind the model to consider saving memories.
         # Counter resets whenever the memory tool is actually used.
@@ -1868,7 +1927,8 @@ class AIAgent:
                 and self._memory_store):
             self._turns_since_memory += 1
             if self._turns_since_memory >= self._memory_nudge_interval:
-                user_message += (
+                user_message = self._append_text_to_user_content(
+                    user_message,
                     "\n\n[System: You've had several exchanges in this session. "
                     "Consider whether there's anything worth saving to your memories.]"
                 )
@@ -1879,7 +1939,8 @@ class AIAgent:
         if (self._skill_nudge_interval > 0
                 and self._iters_since_skill >= self._skill_nudge_interval
                 and "skill_manage" in self.valid_tool_names):
-            user_message += (
+            user_message = self._append_text_to_user_content(
+                user_message,
                 "\n\n[System: The previous task involved many steps. "
                 "If you discovered a reusable workflow, consider saving it as a skill.]"
             )
@@ -1887,9 +1948,10 @@ class AIAgent:
 
         # Honcho prefetch: retrieve user context for system prompt injection
         self._honcho_context = ""
+        user_message_text = self._content_to_text(user_message)
         if self._honcho and self._honcho_session_key:
             try:
-                self._honcho_context = self._honcho_prefetch(user_message)
+                self._honcho_context = self._honcho_prefetch(user_message_text)
             except Exception as e:
                 logger.debug("Honcho prefetch failed (non-fatal): %s", e)
 
@@ -1899,7 +1961,10 @@ class AIAgent:
         self._log_msg_to_db(user_msg)
         
         if not self.quiet_mode:
-            print(f"💬 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
+            print(
+                f"💬 Starting conversation: "
+                f"'{user_message_text[:60]}{'...' if len(user_message_text) > 60 else ''}'"
+            )
         
         # ── System prompt (cached per session for prefix caching) ──
         # Built once on first call, reused for all subsequent calls.
@@ -2524,10 +2589,10 @@ class AIAgent:
                 
                 else:
                     # No tool calls - this is the final response
-                    final_response = assistant_message.content or ""
+                    final_response_raw = assistant_message.content or ""
                     
                     # Check if response only has think block with no actual content after it
-                    if not self._has_content_after_think_block(final_response):
+                    if not self._has_content_after_think_block(final_response_raw):
                         # Track retries for empty-after-think responses
                         if not hasattr(self, '_empty_content_retries'):
                             self._empty_content_retries = 0
@@ -2541,7 +2606,7 @@ class AIAgent:
                             reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
                             print(f"{self.log_prefix}   Reasoning: {reasoning_preview}")
                         else:
-                            content_preview = final_response[:80] + "..." if len(final_response) > 80 else final_response
+                            content_preview = final_response_raw[:80] + "..." if len(final_response_raw) > 80 else final_response_raw
                             print(f"{self.log_prefix}   Content: '{content_preview}'")
                         
                         if self._empty_content_retries < 3:
@@ -2567,13 +2632,13 @@ class AIAgent:
                                             tool_names.append(fn.get("name", "unknown"))
                                         msg["content"] = f"Calling the {', '.join(tool_names)} tool{'s' if len(tool_names) > 1 else ''}..."
                                         break
-                                final_response = fallback
+                                final_response = self._strip_think_blocks(fallback).strip()
                                 break
                             
                             # No fallback -- append the empty message as-is
                             empty_msg = {
                                 "role": "assistant",
-                                "content": final_response,
+                                "content": final_response_raw,
                                 "reasoning": reasoning_text,
                                 "finish_reason": finish_reason,
                             }
@@ -2584,7 +2649,7 @@ class AIAgent:
                             self._persist_session(messages, conversation_history)
                             
                             return {
-                                "final_response": final_response or None,
+                                "final_response": final_response_raw or None,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
@@ -2595,6 +2660,9 @@ class AIAgent:
                     # Reset retry counter on successful content
                     if hasattr(self, '_empty_content_retries'):
                         self._empty_content_retries = 0
+                    
+                    # User-facing response should not include internal reasoning tags.
+                    final_response = self._strip_think_blocks(final_response_raw).strip()
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
@@ -2663,7 +2731,7 @@ class AIAgent:
         completed = final_response is not None and api_call_count < self.max_iterations
 
         # Save trajectory if enabled
-        self._save_trajectory(messages, user_message, completed)
+        self._save_trajectory(messages, user_message_text, completed)
 
         # Clean up VM and browser for this task after conversation completes
         self._cleanup_task_resources(effective_task_id)

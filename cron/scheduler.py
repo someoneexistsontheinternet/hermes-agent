@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output
+from model_runtime_config import load_model_runtime_config
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
@@ -176,29 +177,26 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Custom endpoint (OPENAI_*) takes precedence, matching CLI behavior
         api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
         base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        model_extra_body = None
 
         try:
-            import yaml
-            _cfg_path = str(_hermes_home / "config.yaml")
-            if os.path.exists(_cfg_path):
-                with open(_cfg_path) as _f:
-                    _cfg = yaml.safe_load(_f) or {}
-                _model_cfg = _cfg.get("model", {})
-                if isinstance(_model_cfg, str):
-                    model = _model_cfg
-                elif isinstance(_model_cfg, dict):
-                    model = _model_cfg.get("default", model)
-                    base_url = _model_cfg.get("base_url", base_url)
-                # Check if provider is nous — resolve OAuth credentials
-                provider = _model_cfg.get("provider", "") if isinstance(_model_cfg, dict) else ""
-                if provider == "nous":
-                    try:
-                        from hermes_cli.auth import resolve_nous_runtime_credentials
-                        creds = resolve_nous_runtime_credentials(min_key_ttl_seconds=5 * 60)
-                        api_key = creds.get("api_key", api_key)
-                        base_url = creds.get("base_url", base_url)
-                    except Exception as nous_err:
-                        logging.warning("Nous Portal credential resolution failed for cron: %s", nous_err)
+            resolved = load_model_runtime_config(
+                _hermes_home / "config.yaml",
+                default_model=model,
+                default_base_url=base_url,
+                logger=logger,
+            )
+            model = resolved.model
+            base_url = resolved.base_url
+            model_extra_body = resolved.extra_body
+            if resolved.provider == "nous":
+                try:
+                    from hermes_cli.auth import resolve_nous_runtime_credentials
+                    creds = resolve_nous_runtime_credentials(min_key_ttl_seconds=5 * 60)
+                    api_key = creds.get("api_key", api_key)
+                    base_url = creds.get("base_url", base_url)
+                except Exception as nous_err:
+                    logging.warning("Nous Portal credential resolution failed for cron: %s", nous_err)
         except Exception:
             pass
 
@@ -206,6 +204,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             model=model,
             api_key=api_key,
             base_url=base_url,
+            model_extra_body=model_extra_body,
             quiet_mode=True,
             session_id=f"cron_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )

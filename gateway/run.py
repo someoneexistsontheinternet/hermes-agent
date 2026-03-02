@@ -14,12 +14,16 @@ Usage:
 """
 
 import asyncio
+import base64
 import logging
+import mimetypes
 import os
 import re
 import sys
 import signal
 import threading
+import urllib.parse
+import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
@@ -36,9 +40,11 @@ from dotenv import load_dotenv
 _env_path = _hermes_home / '.env'
 if _env_path.exists():
     try:
-        load_dotenv(_env_path, encoding="utf-8")
+        # Override inherited service env vars (e.g. launchd/systemd) so
+        # ~/.hermes/.env is the source of truth for gateway auth flags.
+        load_dotenv(_env_path, override=True, encoding="utf-8")
     except UnicodeDecodeError:
-        load_dotenv(_env_path, encoding="latin-1")
+        load_dotenv(_env_path, override=True, encoding="latin-1")
 # Also try project .env as fallback
 load_dotenv()
 
@@ -107,6 +113,7 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from model_runtime_config import load_model_runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -471,6 +478,28 @@ class GatewayRunner:
             return SlackAdapter(config)
         
         return None
+
+    @staticmethod
+    def _is_truthy(value: Any) -> bool:
+        """Parse flexible truthy values from env/config strings."""
+        if value is None:
+            return False
+        return str(value).strip().strip('"').strip("'").lower() in (
+            "true", "1", "yes", "y", "on"
+        )
+
+    def _discord_dms_enabled(self) -> bool:
+        """Return whether Discord DMs are enabled for this gateway process."""
+        env_val = (os.getenv("DISCORD_ENABLE_DMS", "") or "").strip()
+        if env_val:
+            return self._is_truthy(env_val)
+
+        pconfig = self.config.platforms.get(Platform.DISCORD)
+        if not pconfig or not isinstance(pconfig.extra, dict):
+            return True
+        if "enable_dms" in pconfig.extra:
+            return self._is_truthy(pconfig.extra.get("enable_dms"))
+        return True
     
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -502,7 +531,8 @@ class GatewayRunner:
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
-        if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in ("true", "1", "yes"):
+        platform_allow_all_val = os.getenv(platform_allow_all_var, "") if platform_allow_all_var else ""
+        if platform_allow_all_var and self._is_truthy(platform_allow_all_val):
             return True
 
         # Check pairing store (always checked, regardless of allowlists)
@@ -516,7 +546,19 @@ class GatewayRunner:
 
         if not platform_allowlist and not global_allowlist:
             # No allowlists configured -- check global allow-all flag
-            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
+            gateway_allow_all_val = os.getenv("GATEWAY_ALLOW_ALL_USERS", "")
+            allowed = self._is_truthy(gateway_allow_all_val)
+            if not allowed:
+                logger.debug(
+                    "Auth deny (no allowlists, allow-all disabled): platform=%s user_id=%s "
+                    "platform_allow_all_var=%s platform_allow_all_val=%r gateway_allow_all_val=%r",
+                    source.platform.value if source.platform else "unknown",
+                    user_id,
+                    platform_allow_all_var,
+                    platform_allow_all_val,
+                    gateway_allow_all_val,
+                )
+            return allowed
 
         # Check if user is in any allowlist
         allowed_ids = set()
@@ -529,7 +571,18 @@ class GatewayRunner:
         check_ids = {user_id}
         if "@" in user_id:
             check_ids.add(user_id.split("@")[0])
-        return bool(check_ids & allowed_ids)
+        allowed = bool(check_ids & allowed_ids)
+        if not allowed:
+            logger.debug(
+                "Auth deny (allowlist mismatch): platform=%s user_id=%s check_ids=%s "
+                "platform_allowlist=%r global_allowlist=%r",
+                source.platform.value if source.platform else "unknown",
+                user_id,
+                sorted(check_ids),
+                platform_allowlist,
+                global_allowlist,
+            )
+        return allowed
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -545,12 +598,34 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+
+        # Optional Discord DM hard-block (defense-in-depth in gateway layer).
+        if (
+            source.platform == Platform.DISCORD
+            and source.chat_type == "dm"
+            and not self._discord_dms_enabled()
+        ):
+            logger.info("Ignoring Discord DM because DISCORD_ENABLE_DMS is disabled")
+            return None
         
         # Check if user is authorized
         if not self._is_user_authorized(source):
-            logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
-            if source.chat_type == "dm":
+            p = source.platform.value if source.platform else "unknown"
+            logger.warning(
+                "Unauthorized user: %s (%s) on %s | DISCORD_ALLOW_ALL_USERS=%r "
+                "GATEWAY_ALLOW_ALL_USERS=%r DISCORD_ALLOWED_USERS=%r GATEWAY_ALLOWED_USERS=%r",
+                source.user_id,
+                source.user_name,
+                p,
+                os.getenv("DISCORD_ALLOW_ALL_USERS"),
+                os.getenv("GATEWAY_ALLOW_ALL_USERS"),
+                os.getenv("DISCORD_ALLOWED_USERS"),
+                os.getenv("GATEWAY_ALLOWED_USERS"),
+            )
+            # In DMs: offer pairing code unless DMs are disabled. In groups: silently ignore.
+            if source.chat_type == "dm" and not (
+                source.platform == Platform.DISCORD and not self._discord_dms_enabled()
+            ):
                 platform_name = source.platform.value if source.platform else "unknown"
                 code = self.pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
@@ -647,7 +722,12 @@ class GatewayRunner:
             # If it's not clearly an approval/denial, fall through to normal processing
         
         # Get or create session
-        session_entry = self.session_store.get_or_create_session(source)
+        force_auto_reset = bool(getattr(event, "force_auto_reset", False))
+        auto_reset_reason = str(getattr(event, "auto_reset_reason", "") or "").strip()
+        session_entry = self.session_store.get_or_create_session(
+            source,
+            force_auto_reset=force_auto_reset,
+        )
         session_key = session_entry.session_key
         
         # Build session context
@@ -658,15 +738,23 @@ class GatewayRunner:
         
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context)
+        extra_context = (getattr(event, "extra_context", "") or "").strip()
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
-            context_prompt = (
-                "[System note: The user's previous session expired due to inactivity. "
-                "This is a fresh conversation with no prior context.]\n\n"
-                + context_prompt
-            )
+            if auto_reset_reason:
+                note = (
+                    "[System note: The previous session was automatically reset "
+                    f"before this turn ({auto_reset_reason}). "
+                    "This is a fresh conversation with no prior context.]"
+                )
+            else:
+                note = (
+                    "[System note: The user's previous session expired due to inactivity. "
+                    "This is a fresh conversation with no prior context.]"
+                )
+            context_prompt = note + "\n\n" + context_prompt
             session_entry.was_auto_reset = False
         
         # Load conversation history from transcript
@@ -697,30 +785,20 @@ class GatewayRunner:
                     )
         
         # -----------------------------------------------------------------
-        # Auto-analyze images sent by the user
+        # Image handling strategy
         #
-        # If the user attached image(s), we run the vision tool eagerly so
-        # the conversation model always receives a text description.  The
-        # local file path is also included so the model can re-examine the
-        # image later with a more targeted question via vision_analyze.
-        #
-        # We filter to image paths only (by media_type) so that non-image
-        # attachments (documents, audio, etc.) are not sent to the vision
-        # tool even when they appear in the same message.
+        # For OpenAI/Gemini/Anthropic model families, send image_url parts
+        # directly in the user content payload (multimodal). For other models,
+        # keep the existing vision pre-analysis fallback path.
         # -----------------------------------------------------------------
         message_text = event.text or ""
-        if event.media_urls:
-            image_paths = []
-            for i, path in enumerate(event.media_urls):
-                # Check media_types if available; otherwise infer from message type
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                is_image = (
-                    mtype.startswith("image/")
-                    or event.message_type == MessageType.PHOTO
-                )
-                if is_image:
-                    image_paths.append(path)
-            if image_paths:
+        image_items = self._collect_multimodal_image_items(event)
+        supports_direct_multimodal = False
+        if image_items:
+            model_name = self._current_model_name()
+            supports_direct_multimodal = self._model_supports_direct_multimodal(model_name)
+            if not supports_direct_multimodal:
+                image_paths = [item["path"] for item in image_items]
                 message_text = await self._enrich_message_with_vision(
                     message_text, image_paths
                 )
@@ -775,6 +853,33 @@ class GatewayRunner:
                     )
                 message_text = f"{context_note}\n\n{message_text}"
 
+        # Keep Discord channel context in the user turn (not in system prompt).
+        if extra_context:
+            # For plain Discord text turns, rely on the injected Discord context
+            # block as the full user payload (it already includes the current turn).
+            use_discord_context_only = (
+                source.platform == Platform.DISCORD
+                and event.message_type == MessageType.TEXT
+                and not event.media_urls
+            )
+            if use_discord_context_only:
+                message_text = extra_context
+            else:
+                message_text = f"{extra_context}\n\n{message_text}".strip()
+
+        message_payload: Any = message_text
+        if image_items and supports_direct_multimodal:
+            multimodal_payload = self._build_multimodal_user_payload(message_text, image_items)
+            if multimodal_payload:
+                message_payload = multimodal_payload
+            else:
+                image_paths = [item["path"] for item in image_items]
+                if image_paths:
+                    message_text = await self._enrich_message_with_vision(
+                        message_text, image_paths
+                    )
+                    message_payload = message_text
+
         try:
             # Emit agent:start hook
             hook_ctx = {
@@ -787,7 +892,7 @@ class GatewayRunner:
             
             # Run the agent
             agent_result = await self._run_agent(
-                message=message_text,
+                message=message_payload,
                 context_prompt=context_prompt,
                 history=history,
                 source=source,
@@ -845,8 +950,13 @@ class GatewayRunner:
                 )
             
             # Find only the NEW messages from this turn (skip history we loaded)
-            history_len = len(history)
-            new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else agent_messages
+            history_input_len = int(agent_result.get("history_input_len", len(history)))
+            history_input_len = max(0, history_input_len)
+            new_messages = (
+                agent_messages[history_input_len:]
+                if len(agent_messages) > history_input_len
+                else []
+            )
             
             # If no new messages found (edge case), fall back to simple user/assistant
             if not new_messages:
@@ -931,6 +1041,17 @@ class GatewayRunner:
         
         # Reset the session
         new_entry = self.session_store.reset_session(session_key)
+
+        # For Discord, reset channel-level turn anchoring so the next user turn
+        # always starts from a fresh latest-N context window.
+        if source.platform == Platform.DISCORD:
+            adapter = self.adapters.get(Platform.DISCORD)
+            reset_channel_context = getattr(adapter, "reset_channel_context", None)
+            if callable(reset_channel_context):
+                try:
+                    reset_channel_context(source.chat_id)
+                except Exception as e:
+                    logger.debug("Discord channel context reset failed: %s", e)
         
         # Emit session:reset hook
         await self.hooks.emit("session:reset", {
@@ -1204,7 +1325,300 @@ class GatewayRunner:
         for var in ["HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME"]:
             if var in os.environ:
                 del os.environ[var]
-    
+
+    def _current_model_name(self) -> str:
+        """Resolve the active model name using env + ~/.hermes/config.yaml."""
+        model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
+        try:
+            import yaml
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path) as f:
+                    cfg = yaml.safe_load(f) or {}
+                model_cfg = cfg.get("model", {})
+                if isinstance(model_cfg, str):
+                    model = model_cfg
+                elif isinstance(model_cfg, dict):
+                    model = model_cfg.get("default", model)
+        except Exception:
+            pass
+        return str(model or "").strip()
+
+    @staticmethod
+    def _model_supports_direct_multimodal(model_name: str) -> bool:
+        """Return True when the model family is known to support image_url input."""
+        model = (model_name or "").strip().lower()
+        if not model:
+            return False
+        if model.startswith(("openai/", "anthropic/", "google/gemini")):
+            return True
+        return model.startswith(("gpt-", "claude", "gemini"))
+
+    @staticmethod
+    def _is_http_url(value: str) -> bool:
+        value = (value or "").strip().lower()
+        return value.startswith("http://") or value.startswith("https://")
+
+    @staticmethod
+    def _is_data_image_url(value: str) -> bool:
+        value = (value or "").strip().lower()
+        return value.startswith("data:image/")
+
+    @staticmethod
+    def _is_gif_media(path: str, media_type: str) -> bool:
+        mtype = (media_type or "").split(";", 1)[0].strip().lower()
+        if mtype == "image/gif":
+            return True
+        path_no_query = (path or "").split("?", 1)[0].lower()
+        return path_no_query.endswith(".gif")
+
+    @staticmethod
+    def _emoji_name_from_media_type(media_type: str) -> str:
+        for part in str(media_type or "").split(";"):
+            part = part.strip()
+            if part.startswith("name="):
+                return part.split("=", 1)[1].strip()
+        return ""
+
+    @staticmethod
+    def _source_url_from_media_type(media_type: str) -> str:
+        for part in str(media_type or "").split(";"):
+            part = part.strip()
+            if part.startswith("source_url="):
+                return part.split("=", 1)[1].strip()
+        return ""
+
+    def _collect_multimodal_image_items(self, event: MessageEvent) -> List[Dict[str, str]]:
+        """
+        Collect image inputs from an event for direct multimodal payloads.
+
+        Filters out GIFs and captures optional emoji labels.
+        """
+        items: List[Dict[str, str]] = []
+        seen_keys = set()
+        attachments = list(getattr(getattr(event, "raw_message", None), "attachments", []) or [])
+        for i, path in enumerate(event.media_urls or []):
+            media_type = event.media_types[i] if i < len(event.media_types) else ""
+            lower_type = str(media_type or "").lower()
+            is_discord_emoji = lower_type.startswith("image/x-discord-emoji")
+            is_image = lower_type.startswith("image/") or is_discord_emoji or event.message_type == MessageType.PHOTO
+            if not is_image or self._is_gif_media(path, media_type):
+                continue
+
+            source_url = self._source_url_from_media_type(media_type)
+            if not source_url and i < len(attachments):
+                att = attachments[i]
+                att_type = getattr(att, "content_type", "") or ""
+                att_url = getattr(att, "url", "") or ""
+                if att_type.startswith("image/") and not self._is_gif_media(att_url, att_type):
+                    source_url = att_url
+
+            dedupe_key = source_url or path
+            if dedupe_key and dedupe_key in seen_keys:
+                continue
+            if dedupe_key:
+                seen_keys.add(dedupe_key)
+            items.append(
+                {
+                    "path": path,
+                    "media_type": media_type or "image/*",
+                    "source_url": source_url,
+                    "emoji_name": self._emoji_name_from_media_type(media_type) if is_discord_emoji else "",
+                }
+            )
+
+        # Optional follow-up image carryover (e.g., "image + next text turn").
+        for extra in list(getattr(event, "carryover_image_items", []) or []):
+            if not isinstance(extra, dict):
+                continue
+            path = (extra.get("path") or "").strip()
+            source_url = (extra.get("source_url") or "").strip()
+            media_type = (extra.get("media_type") or "image/*").strip() or "image/*"
+            emoji_name = (extra.get("emoji_name") or "").strip()
+            dedupe_key = source_url or path
+            if not dedupe_key:
+                continue
+            if dedupe_key in seen_keys:
+                continue
+            if self._is_gif_media(dedupe_key, media_type):
+                continue
+            seen_keys.add(dedupe_key)
+            items.append(
+                {
+                    "path": path or source_url,
+                    "media_type": media_type,
+                    "source_url": source_url,
+                    "emoji_name": emoji_name,
+                }
+            )
+        return items
+
+    def _local_image_to_data_url(self, path: str, media_type: str) -> Optional[str]:
+        """Convert a local image path into a data URL for API image_url fields."""
+        if self._is_data_image_url(path):
+            return str(path).strip()
+
+        try:
+            p = Path(path)
+            if not p.exists() or not p.is_file():
+                return None
+        except (OSError, ValueError) as e:
+            logger.debug("Could not interpret image path for multimodal payload (%r): %s", path, e)
+            return None
+        try:
+            if p.stat().st_size > 8 * 1024 * 1024:
+                logger.warning("Skipping oversized local image for multimodal payload: %s", p)
+                return None
+            mime_type = str(media_type or "").split(";", 1)[0].strip().lower()
+            if not mime_type.startswith("image/") or mime_type == "image/*":
+                guessed, _ = mimetypes.guess_type(p.name)
+                mime_type = guessed or "image/jpeg"
+            raw = p.read_bytes()
+            encoded = base64.b64encode(raw).decode("ascii")
+            return f"data:{mime_type};base64,{encoded}"
+        except Exception as e:
+            logger.debug("Could not convert local image to data URL (%s): %s", p, e)
+            return None
+
+    def _http_image_to_data_url(self, url: str, media_type: str) -> Optional[str]:
+        """Download an HTTP image URL and convert it to a base64 data URL."""
+        if not self._is_http_url(url):
+            return None
+        try:
+            max_bytes = 8 * 1024 * 1024
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                    "Accept": "image/*,*/*;q=0.8",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read(max_bytes + 1)
+                if len(raw) > max_bytes:
+                    logger.warning("Skipping oversized remote image for multimodal payload: %s", url)
+                    return None
+                header_mime = str(resp.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+            mime_type = header_mime
+            if not mime_type.startswith("image/"):
+                mime_type = str(media_type or "").split(";", 1)[0].strip().lower()
+            if not mime_type.startswith("image/") or mime_type == "image/*":
+                guessed, _ = mimetypes.guess_type(urllib.parse.urlparse(url).path)
+                mime_type = guessed or "image/jpeg"
+            encoded = base64.b64encode(raw).decode("ascii")
+            return f"data:{mime_type};base64,{encoded}"
+        except Exception as e:
+            logger.debug("Could not convert remote image URL to data URL (%s): %s", url, e)
+            return None
+
+    def _resolve_image_payload_url(self, item: Dict[str, str]) -> Optional[str]:
+        """Resolve an image URL usable by chat-completions image_url content parts."""
+        path = (item.get("path") or "").strip()
+        source_url = (item.get("source_url") or "").strip()
+
+        # Preserve existing data URLs from history as-is.
+        if self._is_data_image_url(source_url):
+            return source_url
+        if self._is_data_image_url(path):
+            return path
+
+        # Prefer local cached files so providers that reject remote URL sources
+        # still receive a valid base64-encoded image payload.
+        data_url = self._local_image_to_data_url(path, item.get("media_type", ""))
+        if data_url:
+            return data_url
+
+        data_url = self._http_image_to_data_url(source_url, item.get("media_type", ""))
+        if data_url:
+            return data_url
+        data_url = self._http_image_to_data_url(path, item.get("media_type", ""))
+        if data_url:
+            return data_url
+        # Do not pass raw HTTP URLs through to providers that require base64 sources.
+        return None
+
+    def _sanitize_multimodal_history_content(self, content: Any) -> Any:
+        """
+        Ensure historical multimodal image parts are base64 data URLs.
+
+        Older transcript rows may contain raw HTTP image_url values from before
+        local/base64 normalization was added. Convert when possible; otherwise
+        replace with a text placeholder so requests don't hard-fail.
+        """
+        if not isinstance(content, list):
+            return content
+
+        sanitized: List[Any] = []
+        for part in content:
+            if not isinstance(part, dict):
+                sanitized.append(part)
+                continue
+            if part.get("type") != "image_url":
+                sanitized.append(part)
+                continue
+
+            image_obj = part.get("image_url")
+            url = image_obj.get("url", "") if isinstance(image_obj, dict) else ""
+            payload_url = self._resolve_image_payload_url(
+                {
+                    "path": str(url or ""),
+                    "source_url": str(url or ""),
+                    "media_type": "",
+                }
+            )
+            if payload_url:
+                new_part = dict(part)
+                new_image_obj = dict(image_obj) if isinstance(image_obj, dict) else {}
+                new_image_obj["url"] = payload_url
+                new_part["image_url"] = new_image_obj
+                sanitized.append(new_part)
+            else:
+                sanitized.append({"type": "text", "text": "[image omitted: unavailable]"})
+
+        return sanitized
+
+    def _build_multimodal_user_payload(
+        self,
+        user_text: str,
+        image_items: List[Dict[str, str]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Build OpenAI-style user content parts with text + image_url entries.
+
+        Emoji images are preceded by a short `<emoji_name>:` text part.
+        """
+        if not image_items:
+            return None
+
+        parts: List[Dict[str, Any]] = []
+        text = (user_text or "").strip()
+        if text:
+            parts.append({"type": "text", "text": text})
+        else:
+            parts.append({"type": "text", "text": "[User attached image(s)]"})
+
+        added_images = 0
+        for idx, item in enumerate(image_items, start=1):
+            payload_url = self._resolve_image_payload_url(item)
+            if not payload_url:
+                continue
+            emoji_name = (item.get("emoji_name") or "").strip()
+            if emoji_name:
+                parts.append({"type": "text", "text": f"{emoji_name}: "})
+            elif len(image_items) > 1:
+                parts.append({"type": "text", "text": f"[attached_image_{idx}]"})
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": payload_url},
+                }
+            )
+            added_images += 1
+
+        if added_images == 0:
+            return None
+        return parts
+
     async def _enrich_message_with_vision(
         self,
         user_text: str,
@@ -1401,7 +1815,7 @@ class GatewayRunner:
 
     async def _run_agent(
         self,
-        message: str,
+        message: Any,
         context_prompt: str,
         history: List[Dict[str, Any]],
         source: SessionSource,
@@ -1606,33 +2020,50 @@ class GatewayRunner:
             except Exception:
                 pass
 
-            # Custom endpoint (OPENAI_*) takes precedence, matching CLI behavior
-            api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
+            # Keep messaging sessions pinned to MESSAGING_CWD. Re-loading .env
+            # with override=True can re-introduce a stale TERMINAL_CWD (e.g. ".")
+            # which breaks container backends that require absolute -w paths.
+            os.environ["TERMINAL_CWD"] = os.getenv("MESSAGING_CWD") or str(Path.home())
+
+            # Custom endpoint (OPENAI_*) takes precedence for base_url.
+            # API key selection is based on the effective provider/base URL to
+            # avoid sending OPENAI_API_KEY to OpenRouter endpoints.
+            openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+            openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
             base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
+            def _select_api_key(target_base_url: str, provider_hint: str = "") -> str:
+                provider_hint = (provider_hint or "").strip().lower()
+                target_base = (target_base_url or "").lower()
+                if provider_hint == "openrouter" or "openrouter.ai" in target_base:
+                    return openrouter_key or openai_key
+                return openai_key or openrouter_key
+
+            api_key = _select_api_key(base_url)
             model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
+            model_extra_body = None
 
             try:
-                import yaml as _y
-                _cfg_path = _hermes_home / "config.yaml"
-                if _cfg_path.exists():
-                    with open(_cfg_path) as _f:
-                        _cfg = _y.safe_load(_f) or {}
-                    _model_cfg = _cfg.get("model", {})
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        model = _model_cfg.get("default", model)
-                        base_url = _model_cfg.get("base_url", base_url)
-                    # Check if provider is nous — resolve OAuth credentials
-                    provider = _model_cfg.get("provider", "") if isinstance(_model_cfg, dict) else ""
-                    if provider == "nous":
-                        try:
-                            from hermes_cli.auth import resolve_nous_runtime_credentials
-                            creds = resolve_nous_runtime_credentials(min_key_ttl_seconds=5 * 60)
-                            api_key = creds.get("api_key", api_key)
-                            base_url = creds.get("base_url", base_url)
-                        except Exception as nous_err:
-                            logger.warning("Nous Portal credential resolution failed: %s", nous_err)
+                resolved = load_model_runtime_config(
+                    _hermes_home / "config.yaml",
+                    default_model=model,
+                    default_base_url=base_url,
+                    logger=logger,
+                )
+                model = resolved.model
+                base_url = resolved.base_url
+                model_extra_body = resolved.extra_body
+                if resolved.provider == "nous":
+                    try:
+                        from hermes_cli.auth import resolve_nous_runtime_credentials
+                        creds = resolve_nous_runtime_credentials(min_key_ttl_seconds=5 * 60)
+                        api_key = creds.get("api_key", api_key)
+                        base_url = creds.get("base_url", base_url)
+                    except Exception as nous_err:
+                        logger.warning("Nous Portal credential resolution failed: %s", nous_err)
+                else:
+                    # Re-evaluate key selection after config-based base_url/provider override.
+                    api_key = _select_api_key(base_url, resolved.provider)
             except Exception:
                 pass
 
@@ -1647,11 +2078,13 @@ class GatewayRunner:
                 ephemeral_system_prompt=combined_ephemeral or None,
                 prefill_messages=self._prefill_messages or None,
                 reasoning_config=self._reasoning_config,
+                model_extra_body=model_extra_body,
                 session_id=session_id,
                 tool_progress_callback=progress_callback if tool_progress_enabled else None,
                 platform=platform_key,
                 honcho_session_key=session_key,
                 session_db=self._session_db,
+                session_db_writes=False,
             )
             
             # Store agent reference for interrupt support
@@ -1668,6 +2101,27 @@ class GatewayRunner:
             #      - These must be passed through intact so the API sees valid
             #        assistant→tool sequences (dropping tool_calls causes 500 errors)
             agent_history = []
+            last_signature = None
+
+            def _signature(msg_obj: Dict[str, Any]) -> Optional[tuple]:
+                """Stable signature for lightweight transcript de-duplication."""
+                try:
+                    payload = json.dumps(msg_obj, sort_keys=True, ensure_ascii=False)
+                except Exception:
+                    payload = str(msg_obj)
+                return (msg_obj.get("role"), payload)
+
+            def _append_history(msg_obj: Dict[str, Any]) -> None:
+                nonlocal last_signature
+                # Older sessions may contain duplicate assistant/tool rows from
+                # legacy double-write paths. Skip only exact adjacent duplicates.
+                role = msg_obj.get("role")
+                sig = _signature(msg_obj)
+                if role in ("assistant", "tool", "function") and sig == last_signature:
+                    return
+                agent_history.append(msg_obj)
+                last_signature = sig
+
             for msg in history:
                 role = msg.get("role")
                 if not role:
@@ -1690,18 +2144,23 @@ class GatewayRunner:
                 
                 if has_tool_calls or has_tool_call_id or is_tool_message:
                     clean_msg = {k: v for k, v in msg.items() if k != "timestamp"}
-                    agent_history.append(clean_msg)
+                    if "content" in clean_msg:
+                        clean_msg["content"] = self._sanitize_multimodal_history_content(clean_msg.get("content"))
+                    _append_history(clean_msg)
                 else:
                     # Simple text message - just need role and content
                     content = msg.get("content")
                     if content:
+                        content = self._sanitize_multimodal_history_content(content)
                         # Tag cross-platform mirror messages so the agent knows their origin
                         if msg.get("mirror"):
                             mirror_src = msg.get("mirror_source", "another session")
                             content = f"[Delivered from {mirror_src}] {content}"
-                        agent_history.append({"role": role, "content": content})
+                        _append_history({"role": role, "content": content})
             
-            result = agent.run_conversation(message, conversation_history=agent_history)
+            history_input_len = len(agent_history)
+            user_payload = self._sanitize_multimodal_history_content(message)
+            result = agent.run_conversation(user_payload, conversation_history=agent_history)
             result_holder[0] = result
             
             # Return final response, or a message if something went wrong
@@ -1713,6 +2172,7 @@ class GatewayRunner:
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "tools": tools_holder[0] or [],
+                    "history_input_len": history_input_len,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -1752,6 +2212,7 @@ class GatewayRunner:
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "tools": tools_holder[0] or [],
+                "history_input_len": history_input_len,
             }
         
         # Start progress message sender if enabled

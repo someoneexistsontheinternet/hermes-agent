@@ -141,6 +141,14 @@ class TestHasContentAfterThinkBlock:
     def test_no_think_block_returns_true(self, agent):
         assert agent._has_content_after_think_block("just normal content") is True
 
+    def test_only_scratchpad_block_returns_false(self, agent):
+        text = "<REASONING_SCRATCHPAD>hidden</REASONING_SCRATCHPAD>"
+        assert agent._has_content_after_think_block(text) is False
+
+    def test_content_after_scratchpad_returns_true(self, agent):
+        text = "<REASONING_SCRATCHPAD>hidden</REASONING_SCRATCHPAD> visible"
+        assert agent._has_content_after_think_block(text) is True
+
 
 class TestStripThinkBlocks:
     def test_none_returns_empty(self, agent):
@@ -159,6 +167,12 @@ class TestStripThinkBlocks:
         result = agent._strip_think_blocks(text)
         assert "line1" not in result
         assert "visible" in result
+
+    def test_scratchpad_block_removed(self, agent):
+        text = "<REASONING_SCRATCHPAD>reasoning</REASONING_SCRATCHPAD> answer"
+        result = agent._strip_think_blocks(text)
+        assert "reasoning" not in result
+        assert "answer" in result
 
 
 class TestExtractReasoning:
@@ -507,6 +521,23 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
 
+    def test_model_extra_body_merged(self, agent):
+        agent.model_extra_body = {
+            "reasoning": {"enabled": False},
+            "x_test": {"mode": "pass-through"},
+        }
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["extra_body"]["x_test"]["mode"] == "pass-through"
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
+
+    def test_reasoning_config_overrides_model_extra_body_reasoning(self, agent):
+        agent.model_extra_body = {"reasoning": {"enabled": True, "effort": "low"}}
+        agent.reasoning_config = {"enabled": False}
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
+
     def test_max_tokens_injected(self, agent):
         agent.max_tokens = 4096
         messages = [{"role": "user", "content": "hi"}]
@@ -636,6 +667,21 @@ class TestHandleMaxIterations:
         assert "Error" in result or "error" in result
 
 
+class TestUserContentHelpers:
+    def test_content_to_text_with_multimodal_parts(self, agent):
+        content = [
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+        ]
+        assert agent._content_to_text(content) == "hello\n[image]"
+
+    def test_append_text_to_multimodal_parts(self, agent):
+        content = [{"type": "text", "text": "hello"}]
+        updated = agent._append_text_to_user_content(content, "\n\nnote")
+        assert isinstance(updated, list)
+        assert updated[-1] == {"type": "text", "text": "\n\nnote"}
+
+
 class TestRunConversation:
     """Tests for the main run_conversation method.
 
@@ -663,6 +709,21 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_stop_finish_reason_strips_scratchpad_from_final_response(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="<REASONING_SCRATCHPAD>internal</REASONING_SCRATCHPAD> Visible answer",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.return_value = resp
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+        assert result["final_response"] == "Visible answer"
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
@@ -758,3 +819,23 @@ class TestRunConversation:
             )
             result = agent.run_conversation("search something")
         mock_compress.assert_called_once()
+
+    def test_accepts_multimodal_user_message(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="Image received", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory") as mock_save_traj,
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                [
+                    {"type": "text", "text": "what is in this image?"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                ]
+            )
+
+        assert result["final_response"] == "Image received"
+        mock_save_traj.assert_called_once()

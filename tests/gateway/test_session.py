@@ -1,8 +1,11 @@
 """Tests for gateway session management."""
 
+import json
+
 import pytest
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.session import (
+    SessionStore,
     SessionSource,
     build_session_context,
     build_session_context_prompt,
@@ -199,3 +202,43 @@ class TestBuildSessionContextPrompt:
         prompt = build_session_context_prompt(ctx)
 
         assert "WhatsApp" in prompt or "whatsapp" in prompt.lower()
+
+
+class TestLegacyTranscriptFallback:
+    def test_load_legacy_transcript_uses_fallback_home_path_when_richer(
+        self, tmp_path, monkeypatch
+    ):
+        session_id = "sess_123"
+        sessions_dir = tmp_path / "workspace_sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        # Primary path (sessions_dir) has no user turns.
+        primary = sessions_dir / f"{session_id}.jsonl"
+        primary_rows = [
+            {"role": "assistant", "content": "hello"},
+            {"role": "tool", "content": "{\"ok\":true}"},
+        ]
+        with open(primary, "w", encoding="utf-8") as f:
+            for row in primary_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        # Legacy home path has user turns and should be preferred.
+        fake_home = tmp_path / "fake_home"
+        legacy_dir = fake_home / ".hermes" / "sessions"
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        fallback = legacy_dir / f"{session_id}.jsonl"
+        fallback_rows = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "show history"},
+        ]
+        with open(fallback, "w", encoding="utf-8") as f:
+            for row in fallback_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        store = SessionStore(sessions_dir=sessions_dir, config=GatewayConfig())
+        loaded = store._load_legacy_transcript(session_id)
+
+        assert loaded == fallback_rows

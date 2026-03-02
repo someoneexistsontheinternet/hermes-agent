@@ -61,7 +61,7 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
 
 
 def _build_discord(adapter) -> List[Dict[str, str]]:
-    """Enumerate all text channels the Discord bot can see."""
+    """Enumerate text channels the Discord bot can read."""
     channels = []
     client = getattr(adapter, "_client", None)
     if not client:
@@ -73,7 +73,12 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
         return channels
 
     for guild in client.guilds:
+        bot_member = _discord_bot_member(client, guild)
+        if bot_member is None:
+            continue
         for ch in guild.text_channels:
+            if not _discord_channel_is_readable(ch, bot_member):
+                continue
             channels.append({
                 "id": str(ch.id),
                 "name": ch.name,
@@ -86,6 +91,41 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
     # Merge any DMs from session history
     channels.extend(_build_from_sessions("discord"))
     return channels
+
+
+def _discord_bot_member(client: Any, guild: Any) -> Optional[Any]:
+    """Best-effort resolution of the bot member object for one guild."""
+    me = getattr(guild, "me", None)
+    if me is not None:
+        return me
+
+    user = getattr(client, "user", None)
+    user_id = getattr(user, "id", None)
+    get_member = getattr(guild, "get_member", None)
+    if user_id is None or not callable(get_member):
+        return None
+
+    try:
+        return get_member(int(user_id))
+    except Exception:
+        return None
+
+
+def _discord_channel_is_readable(channel: Any, member: Any) -> bool:
+    """True when the bot can view the channel and read message history."""
+    permission_resolver = getattr(channel, "permissions_for", None)
+    if not callable(permission_resolver):
+        return False
+
+    try:
+        perms = permission_resolver(member)
+    except Exception:
+        return False
+
+    return bool(
+        getattr(perms, "view_channel", False)
+        and getattr(perms, "read_message_history", False)
+    )
 
 
 def _build_slack(adapter) -> List[Dict[str, str]]:

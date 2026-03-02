@@ -119,6 +119,29 @@ class TestMessageStorage:
         assert conv[0] == {"role": "user", "content": "Hello"}
         assert conv[1] == {"role": "assistant", "content": "Hi!"}
 
+    def test_multimodal_user_content_roundtrip(self, db):
+        db.create_session(session_id="s1", source="discord")
+        multimodal = [
+            {"type": "text", "text": "transcribe this image"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+        ]
+        db.append_message("s1", role="user", content=multimodal)
+        db.append_message("s1", role="assistant", content="done")
+
+        conv = db.get_messages_as_conversation("s1")
+        assert conv[0]["role"] == "user"
+        assert conv[0]["content"] == multimodal
+        assert conv[1] == {"role": "assistant", "content": "done"}
+
+    def test_tool_content_stays_text_when_json_like(self, db):
+        db.create_session(session_id="s1", source="cli")
+        json_text = '{"ok": true, "n": 1}'
+        db.append_message("s1", role="tool", content=json_text, tool_name="web_search")
+
+        conv = db.get_messages_as_conversation("s1")
+        assert conv[0]["role"] == "tool"
+        assert conv[0]["content"] == json_text
+
     def test_finish_reason_stored(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="assistant", content="Done", finish_reason="stop")

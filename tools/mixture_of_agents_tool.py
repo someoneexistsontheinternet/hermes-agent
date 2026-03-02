@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 REFERENCE_MODELS = [
     "anthropic/claude-opus-4.5",
     "google/gemini-3-pro-preview", 
-    "openai/gpt-5.2-pro",
+    "openai/gpt-5.2",
     "deepseek/deepseek-v3.2"
 ]
 

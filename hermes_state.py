@@ -227,7 +227,7 @@ class SessionDB:
         self,
         session_id: str,
         role: str,
-        content: str = None,
+        content: Any = None,
         tool_name: str = None,
         tool_calls: Any = None,
         tool_call_id: str = None,
@@ -240,6 +240,8 @@ class SessionDB:
         Also increments the session's message_count (and tool_call_count
         if role is 'tool' or tool_calls is present).
         """
+        stored_content = self._serialize_content_for_storage(content)
+
         cursor = self._conn.execute(
             """INSERT INTO messages (session_id, role, content, tool_call_id,
                tool_calls, tool_name, timestamp, token_count, finish_reason)
@@ -247,7 +249,7 @@ class SessionDB:
             (
                 session_id,
                 role,
-                content,
+                stored_content,
                 tool_call_id,
                 json.dumps(tool_calls) if tool_calls else None,
                 tool_name,
@@ -274,6 +276,45 @@ class SessionDB:
 
         self._conn.commit()
         return msg_id
+
+    @staticmethod
+    def _serialize_content_for_storage(content: Any) -> Optional[str]:
+        """Serialize message content into SQLite-storable text."""
+        if content is None or isinstance(content, str):
+            return content
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except Exception:
+            return str(content)
+
+    @staticmethod
+    def _restore_content_for_conversation(role: str, content: Any) -> Any:
+        """
+        Restore non-string user payloads stored as JSON text.
+
+        We only auto-decode user content to avoid accidentally changing tool
+        output semantics (tool content is expected to remain plain text).
+        """
+        if role != "user" or not isinstance(content, str):
+            return content
+
+        text = content.strip()
+        if not text or text[0] not in "[{":
+            return content
+
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return content
+
+        # Expected multimodal shape: [{"type": "...", ...}, ...]
+        if isinstance(parsed, list):
+            if all(isinstance(part, dict) and "type" in part for part in parsed):
+                return parsed
+            return content
+        if isinstance(parsed, dict) and "type" in parsed:
+            return [parsed]
+        return content
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""
@@ -305,7 +346,9 @@ class SessionDB:
         )
         messages = []
         for row in cursor.fetchall():
-            msg = {"role": row["role"], "content": row["content"]}
+            role = row["role"]
+            content = self._restore_content_for_conversation(role, row["content"])
+            msg = {"role": role, "content": content}
             if row["tool_call_id"]:
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:

@@ -422,7 +422,15 @@ def _get_env_config() -> Dict[str, Any]:
     # SSH is excluded since /home/ paths are valid on remote machines.
     cwd = os.getenv("TERMINAL_CWD", default_cwd)
     if env_type in ("modal", "docker", "singularity") and cwd:
-        host_prefixes = ("/Users/", "C:\\", "C:/")
+        # Docker/Modal/Singularity require an absolute in-sandbox path (or "~").
+        # Relative paths like "." cause docker run/exec -w failures.
+        if cwd != "~" and not cwd.startswith("/"):
+            logger.info("Ignoring TERMINAL_CWD=%r for %s backend "
+                        "(must be absolute inside sandbox). Using %r instead.",
+                        cwd, env_type, default_cwd)
+            cwd = default_cwd
+
+        host_prefixes = ("/Users/", "/Volumes/", "C:\\", "C:/")
         if any(cwd.startswith(p) for p in host_prefixes) and cwd != default_cwd:
             logger.info("Ignoring TERMINAL_CWD=%r for %s backend "
                         "(host path won't exist in sandbox). Using %r instead.",

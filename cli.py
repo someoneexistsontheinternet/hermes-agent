@@ -858,6 +858,19 @@ class HermesCLI:
         self.reasoning_config = _parse_reasoning_config(
             CLI_CONFIG["agent"].get("reasoning_effort", "")
         )
+
+        # Optional model-level extra_body passthrough (OpenRouter/OpenAI-compatible).
+        raw_model_extra_body = CLI_CONFIG["model"].get("extra_body")
+        if isinstance(raw_model_extra_body, dict):
+            self.model_extra_body = raw_model_extra_body
+        elif raw_model_extra_body is None:
+            self.model_extra_body = None
+        else:
+            self.model_extra_body = None
+            logger.warning(
+                "Ignoring model.extra_body because it is not a mapping (got %s)",
+                type(raw_model_extra_body).__name__,
+            )
         
         # Agent will be initialized on first use
         self.agent: Optional[AIAgent] = None
@@ -987,6 +1000,7 @@ class HermesCLI:
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config,
+                model_extra_body=self.model_extra_body,
                 session_id=self.session_id,
                 platform="cli",
                 session_db=self._session_db,
