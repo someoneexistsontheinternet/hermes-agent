@@ -12,6 +12,38 @@ logger = logging.getLogger(__name__)
 
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
+_REMOTE_PATH_GUARD_BACKENDS = {"docker", "singularity", "modal", "ssh"}
+_HOST_ONLY_PATH_PREFIXES = ("/Users/", "/Volumes/", "C:\\", "C:/")
+
+
+def _reject_host_only_path(path: Optional[str]) -> Optional[str]:
+    """Reject host-local absolute paths when the backend is sandboxed/remote."""
+    candidate = str(path or "").strip()
+    if not candidate:
+        return None
+
+    if not candidate.startswith(_HOST_ONLY_PATH_PREFIXES):
+        return None
+
+    from tools.terminal_tool import _get_env_config
+
+    try:
+        env_type = _get_env_config().get("env_type", "local")
+    except Exception:
+        return None
+
+    if env_type not in _REMOTE_PATH_GUARD_BACKENDS:
+        return None
+
+    return json.dumps(
+        {
+            "error": (
+                f"Host path not accessible from {env_type} backend: {candidate}. "
+                "Use a path inside the sandbox such as /workspace/... or a mounted volume."
+            )
+        },
+        ensure_ascii=False,
+    )
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
@@ -81,6 +113,18 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             cwd = overrides.get("cwd") or config["cwd"]
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
+            if env_type == "singularity":
+                _check_disk_usage_warning()
+
+            ssh_config = None
+            if env_type == "ssh":
+                ssh_config = {
+                    "host": config.get("ssh_host", ""),
+                    "user": config.get("ssh_user", ""),
+                    "port": config.get("ssh_port", 22),
+                    "key": config.get("ssh_key", ""),
+                }
+
             container_config = None
             if env_type in ("docker", "singularity", "modal"):
                 container_config = {
@@ -88,13 +132,16 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "container_memory": config.get("container_memory", 5120),
                     "container_disk": config.get("container_disk", 51200),
                     "container_persistent": config.get("container_persistent", True),
+                    "docker_volumes": config.get("docker_volumes", []),
                 }
             terminal_env = _create_environment(
                 env_type=env_type,
                 image=image,
                 cwd=cwd,
                 timeout=config["timeout"],
+                ssh_config=ssh_config,
                 container_config=container_config,
+                task_id=task_id,
             )
 
             with _env_lock:
@@ -123,6 +170,9 @@ def clear_file_ops_cache(task_id: str = None):
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
+        blocked = _reject_host_only_path(path)
+        if blocked is not None:
+            return blocked
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         return json.dumps(result.to_dict(), ensure_ascii=False)
@@ -133,6 +183,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
     try:
+        blocked = _reject_host_only_path(path)
+        if blocked is not None:
+            return blocked
         file_ops = _get_file_ops(task_id)
         result = file_ops.write_file(path, content)
         return json.dumps(result.to_dict(), ensure_ascii=False)
@@ -146,6 +199,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                task_id: str = "default") -> str:
     """Patch a file using replace mode or V4A patch format."""
     try:
+        if mode == "replace":
+            blocked = _reject_host_only_path(path)
+            if blocked is not None:
+                return blocked
         file_ops = _get_file_ops(task_id)
         
         if mode == "replace":
@@ -172,6 +229,9 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 task_id: str = "default") -> str:
     """Search for content or files."""
     try:
+        blocked = _reject_host_only_path(path)
+        if blocked is not None:
+            return blocked
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,

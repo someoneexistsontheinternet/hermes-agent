@@ -11,8 +11,9 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime
-from typing import Dict, List, Optional, Any, Set, Tuple
+import shlex
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Any, Set, Tuple, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,9 @@ class DiscordAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 2000
     CUSTOM_EMOJI_RE = re.compile(r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_]{1,64}):(?P<id>\d+)>")
     USER_MENTION_RE = re.compile(r"<@!?(?P<id>\d+)>")
+    MAX_INLINE_REACTIONS = 4
+    MAX_INLINE_REACTION_NAMES = 3
+    REACTION_SNAPSHOT_USER_LIMIT = 10
     
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
@@ -83,6 +87,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._active_history_channels: Set[str] = set()
         self._frontfill_rr_index = 0
         self._backfill_rr_index = 0
+        self._thread_parent_rr_index = 0
+        self._thread_seed_initialized: Set[str] = set()
     
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -104,6 +110,12 @@ class DiscordAdapter(BasePlatformAdapter):
             intents.dm_messages = self._dms_enabled()
             intents.guild_messages = True
             intents.members = True
+            if hasattr(intents, "reactions"):
+                intents.reactions = True
+            if hasattr(intents, "guild_reactions"):
+                intents.guild_reactions = True
+            if hasattr(intents, "dm_reactions"):
+                intents.dm_reactions = self._dms_enabled()
             
             # Create bot
             self._client = commands.Bot(
@@ -182,6 +194,37 @@ class DiscordAdapter(BasePlatformAdapter):
                         )
                     except Exception:
                         pass
+
+            @self._client.event
+            async def on_raw_reaction_add(payload: Any):
+                await adapter_self._handle_raw_reaction_event(payload, "reaction_add")
+
+            @self._client.event
+            async def on_raw_reaction_remove(payload: Any):
+                await adapter_self._handle_raw_reaction_event(payload, "reaction_remove")
+
+            @self._client.event
+            async def on_raw_reaction_clear(payload: Any):
+                await adapter_self._handle_raw_reaction_event(payload, "reaction_clear")
+
+            @self._client.event
+            async def on_raw_reaction_clear_emoji(payload: Any):
+                await adapter_self._handle_raw_reaction_event(payload, "reaction_clear_emoji")
+
+            @self._client.event
+            async def on_thread_create(thread: discord.Thread):
+                if not adapter_self._archive_db:
+                    return
+                if not adapter_self._is_channel_allowed(thread):
+                    return
+                try:
+                    await adapter_self._bootstrap_channel_archive(thread)
+                except Exception as e:
+                    logger.debug("Discord thread bootstrap on create failed (%s): %s", getattr(thread, "id", "unknown"), e)
+                try:
+                    await adapter_self._ensure_thread_seed(thread)
+                except Exception as e:
+                    logger.debug("Discord thread seed bootstrap failed (%s): %s", getattr(thread, "id", "unknown"), e)
             
             # Register slash commands
             self._register_slash_commands()
@@ -220,6 +263,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._active_history_channels.clear()
         self._frontfill_rr_index = 0
         self._backfill_rr_index = 0
+        self._thread_parent_rr_index = 0
+        self._thread_seed_initialized.clear()
         if self._archive_db:
             try:
                 self._archive_db.close()
@@ -471,6 +516,40 @@ class DiscordAdapter(BasePlatformAdapter):
             return self._parse_id_set(raw_env)
         return self._parse_id_set(self._extra().get("allowed_guild_ids"))
 
+    def _auto_fork_enabled(self) -> bool:
+        raw_env = (os.getenv("DISCORD_AUTO_FORK_ENABLED", "") or "").strip()
+        if raw_env:
+            return self._is_truthy(raw_env, default=False)
+        return self._is_truthy(self._extra().get("auto_fork_enabled"), default=False)
+
+    def _auto_fork_main_channel_notice(self) -> bool:
+        raw_env = (os.getenv("DISCORD_AUTO_FORK_MAIN_CHANNEL_NOTICE", "") or "").strip()
+        if raw_env:
+            return self._is_truthy(raw_env, default=True)
+        return self._is_truthy(self._extra().get("auto_fork_main_channel_notice"), default=True)
+
+    def _auto_fork_allowed_channel_ids(self) -> Set[str]:
+        raw_env = os.getenv("DISCORD_AUTO_FORK_ALLOWED_CHANNEL_IDS", "")
+        if raw_env.strip():
+            return self._parse_id_set(raw_env)
+        return self._parse_id_set(self._extra().get("auto_fork_allowed_channel_ids"))
+
+    def is_auto_fork_available(self, source: Optional[Any] = None) -> bool:
+        if not self._auto_fork_enabled():
+            return False
+        if source is None:
+            return True
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return False
+        if getattr(source, "chat_type", "") not in {"group", "channel"}:
+            return False
+        allowed_ids = self._auto_fork_allowed_channel_ids()
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        return not allowed_ids or chat_id in allowed_ids
+
+    def auto_fork_main_channel_notice_enabled(self) -> bool:
+        return self._auto_fork_main_channel_notice()
+
     def _dms_enabled(self) -> bool:
         raw_env = (os.getenv("DISCORD_ENABLE_DMS", "") or "").strip()
         if raw_env:
@@ -591,8 +670,41 @@ class DiscordAdapter(BasePlatformAdapter):
     def _full_scrape_include_threads(self) -> bool:
         raw_env = (os.getenv("DISCORD_FULL_SCRAPE_INCLUDE_THREADS", "") or "").strip()
         if raw_env:
-            return self._is_truthy(raw_env, default=False)
-        return self._is_truthy(self._extra().get("full_scrape_include_threads"), default=False)
+            return self._is_truthy(raw_env, default=True)
+        return self._is_truthy(self._extra().get("full_scrape_include_threads"), default=True)
+
+    def _full_scrape_thread_archived_limit(self) -> int:
+        """
+        Number of archived threads fetched per parent-channel sweep.
+        """
+        raw_env = (os.getenv("DISCORD_FULL_SCRAPE_THREAD_ARCHIVED_LIMIT", "") or "").strip()
+        if raw_env:
+            value = self._parse_int(raw_env, 25)
+        else:
+            value = self._parse_int(self._extra().get("full_scrape_thread_archived_limit", 25), 25)
+        return max(5, min(value, 200))
+
+    def _full_scrape_thread_parent_channels_per_tick(self) -> int:
+        """
+        Parent channels to sweep for archived threads each worker tick.
+        """
+        raw_env = (os.getenv("DISCORD_FULL_SCRAPE_THREAD_PARENT_CHANNELS_PER_TICK", "") or "").strip()
+        if raw_env:
+            value = self._parse_int(raw_env, 3)
+        else:
+            value = self._parse_int(self._extra().get("full_scrape_thread_parent_channels_per_tick", 3), 3)
+        return max(1, min(value, 50))
+
+    def _thread_seed_limit(self) -> int:
+        """
+        Message count used for thread seed snapshots (fork + anchored bootstrap).
+        """
+        raw_env = (os.getenv("DISCORD_THREAD_SEED_LIMIT", "") or "").strip()
+        if raw_env:
+            value = self._parse_int(raw_env, 50)
+        else:
+            value = self._parse_int(self._extra().get("thread_seed_limit", 50), 50)
+        return max(1, min(value, 200))
 
     def _backfill_enabled(self) -> bool:
         raw_env = (os.getenv("DISCORD_BACKFILL_ENABLED", "") or "").strip()
@@ -668,6 +780,45 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         return bool(getattr(perms, "view_channel", False))
 
+    @staticmethod
+    def _channel_allowlist_ids(channel: Any) -> Set[str]:
+        """
+        Collect candidate IDs for allowlist matching.
+
+        `allowed_channel_ids` may contain any mix of:
+        - channel IDs
+        - thread IDs
+        - parent channel IDs
+        - category IDs
+        """
+        ids: Set[str] = set()
+        if channel is None:
+            return ids
+
+        def _add(value: Any) -> None:
+            text = str(value or "").strip()
+            if text:
+                ids.add(text)
+
+        # Direct identifiers on the current channel/thread.
+        _add(getattr(channel, "id", ""))
+        _add(getattr(channel, "parent_id", ""))
+        _add(getattr(channel, "category_id", ""))
+
+        # Parent channel (important for thread -> parent-channel -> category).
+        parent = getattr(channel, "parent", None)
+        if parent is not None:
+            _add(getattr(parent, "id", ""))
+            _add(getattr(parent, "parent_id", ""))
+            _add(getattr(parent, "category_id", ""))
+
+        # Category object, when available.
+        category = getattr(channel, "category", None)
+        if category is not None:
+            _add(getattr(category, "id", ""))
+
+        return ids
+
     def _is_channel_allowed(self, channel: Any) -> bool:
         """Check guild/channel allowlists, with optional DM blocking."""
         if not DISCORD_AVAILABLE:
@@ -678,9 +829,10 @@ class DiscordAdapter(BasePlatformAdapter):
             return self._dms_enabled()
 
         allowed_channels = self._allowed_channel_ids()
-        channel_id = str(getattr(channel, "id", ""))
-        if allowed_channels and channel_id not in allowed_channels:
-            return False
+        if allowed_channels:
+            candidate_ids = self._channel_allowlist_ids(channel)
+            if not candidate_ids or not (candidate_ids & allowed_channels):
+                return False
 
         allowed_guilds = self._allowed_guild_ids()
         guild_id = ""
@@ -1066,6 +1218,377 @@ class DiscordAdapter(BasePlatformAdapter):
 
         return "\n\n".join(deduped).strip()
 
+    @staticmethod
+    def _preferred_user_name(user: Any) -> str:
+        for attr in ("name", "global_name", "display_name", "id"):
+            value = str(getattr(user, attr, "") or "").strip()
+            if value:
+                return value
+        return "unknown"
+
+    @staticmethod
+    def _reaction_emoji_metadata(emoji: Any) -> Optional[Dict[str, Any]]:
+        if emoji is None:
+            return None
+        if bool(getattr(emoji, "animated", False)):
+            return None
+
+        emoji_id = getattr(emoji, "id", None)
+        raw_name = getattr(emoji, "name", None)
+        emoji_name = str(raw_name if raw_name not in (None, "") else emoji).strip()
+        if not emoji_name:
+            return None
+
+        is_custom = emoji_id is not None
+        emoji_id_text = str(emoji_id).strip() if emoji_id is not None else ""
+        return {
+            "emoji_key": f"custom:{emoji_id_text}" if is_custom else f"unicode:{emoji_name}",
+            "emoji_name": emoji_name,
+            "emoji_display": emoji_name,
+            "emoji_id": emoji_id_text,
+            "is_custom": is_custom,
+            "animated": False,
+            "image_url": (
+                f"https://cdn.discordapp.com/emojis/{emoji_id_text}.png"
+                if is_custom and emoji_id_text
+                else ""
+            ),
+        }
+
+    def _message_reaction_summary(self, message: DiscordMessage) -> List[Dict[str, Any]]:
+        """Build a lightweight reaction snapshot from a Discord message."""
+        rows: List[Dict[str, Any]] = []
+        for reaction in getattr(message, "reactions", []) or []:
+            meta = self._reaction_emoji_metadata(getattr(reaction, "emoji", None))
+            if not meta:
+                continue
+            try:
+                count = int(getattr(reaction, "count", 0) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count <= 0:
+                continue
+            rows.append(
+                {
+                    **meta,
+                    "count": count,
+                    "reactors": [],
+                    "reactors_complete": False,
+                }
+            )
+        return rows
+
+    async def _hydrate_message_reaction_snapshot(self, message: DiscordMessage) -> List[Dict[str, Any]]:
+        """Fetch reactor usernames for static reactions on one message."""
+        rows: List[Dict[str, Any]] = []
+        for reaction in getattr(message, "reactions", []) or []:
+            meta = self._reaction_emoji_metadata(getattr(reaction, "emoji", None))
+            if not meta:
+                continue
+            try:
+                count = int(getattr(reaction, "count", 0) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count <= 0:
+                continue
+
+            reactors: List[Dict[str, str]] = []
+            seen_user_ids: Set[str] = set()
+            truncated = False
+            try:
+                async for user in reaction.users():
+                    user_id = str(getattr(user, "id", "") or "").strip()
+                    if not user_id or user_id in seen_user_ids:
+                        continue
+                    seen_user_ids.add(user_id)
+                    reactors.append(
+                        {
+                            "user_id": user_id,
+                            "user_name": self._preferred_user_name(user),
+                        }
+                    )
+                    if len(reactors) >= self.REACTION_SNAPSHOT_USER_LIMIT:
+                        truncated = True
+                        break
+            except Exception as e:
+                logger.debug(
+                    "Discord reaction user hydration failed (%s, %s): %s",
+                    getattr(message, "id", "unknown"),
+                    meta.get("emoji_key", ""),
+                    e,
+                )
+                truncated = True
+
+            reactors.sort(
+                key=lambda entry: (
+                    str(entry.get("user_name") or entry.get("user_id") or "").casefold(),
+                    str(entry.get("user_id") or ""),
+                )
+            )
+            rows.append(
+                {
+                    **meta,
+                    "count": max(count, len(reactors)),
+                    "reactors": reactors,
+                    "reactors_complete": (
+                        not truncated and max(count, 0) <= len(reactors)
+                    ),
+                }
+            )
+        return rows
+
+    async def _fetch_channel_by_id(self, channel_id: str) -> Optional[Any]:
+        if not self._client:
+            return None
+        try:
+            numeric_id = int(str(channel_id))
+        except (TypeError, ValueError):
+            return None
+        channel = self._client.get_channel(numeric_id)
+        if channel is not None:
+            return channel
+        try:
+            return await self._client.fetch_channel(numeric_id)
+        except Exception as e:
+            logger.debug("Discord channel fetch failed (%s): %s", channel_id, e)
+            return None
+
+    async def _fetch_message_by_id(
+        self,
+        channel_id: str,
+        message_id: str,
+        *,
+        channel: Any = None,
+    ) -> Optional[DiscordMessage]:
+        target_channel = channel
+        if target_channel is None or str(getattr(target_channel, "id", "")) != str(channel_id):
+            target_channel = await self._fetch_channel_by_id(channel_id)
+        if target_channel is None:
+            return None
+        try:
+            return await target_channel.fetch_message(int(str(message_id)))
+        except (TypeError, ValueError):
+            return None
+        except Exception as e:
+            logger.debug(
+                "Discord message fetch failed (channel=%s, message=%s): %s",
+                channel_id,
+                message_id,
+                e,
+            )
+            return None
+
+    @staticmethod
+    def _row_needs_reaction_hydration(row: Dict[str, Any]) -> bool:
+        # Legacy archive rows may have NULL reaction snapshots because the
+        # column was added after those messages were already stored. Treat that
+        # as "unknown but not worth repairing inline" so a fresh-context build
+        # does not fan out into one API fetch per historical message.
+        if row.get("reactions_json") is None:
+            return False
+        reactions = list(row.get("reactions") or [])
+        if not reactions:
+            return False
+        return any(
+            int(reaction.get("count") or 0) > 0
+            and not bool(reaction.get("reactors_complete"))
+            for reaction in reactions
+            if isinstance(reaction, dict)
+        )
+
+    async def _hydrate_context_reaction_rows(
+        self,
+        channel: Any,
+        rows: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not self._archive_db or not rows:
+            return rows
+
+        hydrated_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            if not self._row_needs_reaction_hydration(row):
+                hydrated_rows.append(row)
+                continue
+
+            fetched = await self._fetch_message_by_id(
+                str(row.get("channel_id") or getattr(channel, "id", "")),
+                str(row.get("message_id") or ""),
+                channel=channel,
+            )
+            if fetched is None:
+                hydrated_rows.append(row)
+                continue
+
+            refreshed_row = self._message_to_archive_row(fetched)
+            refreshed_row["reactions_json"] = await self._hydrate_message_reaction_snapshot(fetched)
+            try:
+                self._archive_db.upsert_message(refreshed_row)
+            except Exception as e:
+                logger.debug(
+                    "Discord reaction snapshot refresh failed (%s): %s",
+                    refreshed_row.get("message_id", "unknown"),
+                    e,
+                )
+                hydrated_rows.append(row)
+                continue
+
+            hydrated_rows.append(
+                self._archive_db.get_message(
+                    refreshed_row["channel_id"],
+                    refreshed_row["message_id"],
+                )
+                or {
+                    **row,
+                    "reactions_json": refreshed_row["reactions_json"],
+                    "reactions": list(refreshed_row["reactions_json"] or []),
+                }
+            )
+        return hydrated_rows
+
+    @staticmethod
+    def _lookup_reactor_name(
+        message_row: Optional[Dict[str, Any]],
+        user_id: str,
+        emoji_key: str = "",
+    ) -> str:
+        if not message_row or not user_id:
+            return ""
+        for reaction in list(message_row.get("reactions") or []):
+            if not isinstance(reaction, dict):
+                continue
+            if emoji_key and str(reaction.get("emoji_key") or "") != emoji_key:
+                continue
+            for reactor in list(reaction.get("reactors") or []):
+                if str(reactor.get("user_id") or "") != user_id:
+                    continue
+                name = str(reactor.get("user_name") or "").strip()
+                if name:
+                    return name
+        return ""
+
+    def _resolve_reaction_actor(
+        self,
+        payload: Any,
+        *,
+        existing_row: Optional[Dict[str, Any]] = None,
+        emoji_key: str = "",
+    ) -> Dict[str, Any]:
+        user = getattr(payload, "member", None)
+        user_id = str(getattr(payload, "user_id", "") or "").strip()
+
+        if user is None and self._client and user_id:
+            getter = getattr(self._client, "get_user", None)
+            if callable(getter):
+                try:
+                    user = getter(int(user_id))
+                except Exception:
+                    user = None
+
+        user_name = self._preferred_user_name(user) if user is not None else ""
+        if not user_name and user_id:
+            user_name = self._lookup_reactor_name(existing_row, user_id, emoji_key)
+        if not user_name and user_id:
+            user_name = user_id
+
+        return {
+            "author_id": user_id or None,
+            "author_name": user_name or None,
+            "author_display": user_name or None,
+            "author_is_bot": bool(getattr(user, "bot", False)),
+        }
+
+    async def _handle_raw_reaction_event(self, payload: Any, change_type: str) -> None:
+        if not self._archive_db or not self._client:
+            return
+
+        channel_id = str(getattr(payload, "channel_id", "") or "").strip()
+        message_id = str(getattr(payload, "message_id", "") or "").strip()
+        if not channel_id or not message_id:
+            return
+
+        emoji_meta: Optional[Dict[str, Any]] = None
+        payload_emoji = getattr(payload, "emoji", None)
+        if payload_emoji is not None:
+            emoji_meta = self._reaction_emoji_metadata(payload_emoji)
+            if emoji_meta is None:
+                return
+
+        channel = await self._fetch_channel_by_id(channel_id)
+        if channel is None or not self._is_channel_allowed(channel):
+            return
+
+        existing_row = self._archive_db.get_message(channel_id, message_id)
+        fetched_message = await self._fetch_message_by_id(channel_id, message_id, channel=channel)
+        if fetched_message is not None:
+            fetched_author = getattr(fetched_message, "author", None)
+            if bool(getattr(fetched_author, "bot", False)):
+                return
+            refreshed_row = self._message_to_archive_row(fetched_message)
+            refreshed_row["reactions_json"] = await self._hydrate_message_reaction_snapshot(fetched_message)
+            try:
+                self._archive_db.upsert_message(refreshed_row)
+            except Exception as e:
+                logger.debug("Discord reaction archive upsert failed: %s", e)
+            message_row = self._archive_db.get_message(channel_id, message_id) or refreshed_row
+            message_author_id = str(getattr(fetched_author, "id", "") or "").strip() or None
+            message_author_name = self._preferred_user_name(fetched_author)
+            original_created_at = (
+                float(fetched_message.created_at.timestamp())
+                if getattr(fetched_message, "created_at", None) is not None
+                else None
+            )
+        else:
+            message_row = existing_row
+            if message_row and bool(message_row.get("author_is_bot")):
+                return
+            message_author_id = (
+                str(message_row.get("author_id") or "").strip() or None
+                if message_row
+                else None
+            )
+            message_author_name = (
+                str(
+                    message_row.get("author_display")
+                    or message_row.get("author_name")
+                    or message_row.get("author_id")
+                    or ""
+                ).strip()
+                if message_row
+                else ""
+            )
+            original_created_at = message_row.get("created_at") if message_row else None
+
+        actor = self._resolve_reaction_actor(
+            payload,
+            existing_row=existing_row,
+            emoji_key=str((emoji_meta or {}).get("emoji_key") or ""),
+        )
+
+        try:
+            self._archive_db.record_reaction_change(
+                message_id=message_id,
+                channel_id=channel_id,
+                guild_id=(
+                    str(getattr(payload, "guild_id", "") or "").strip() or
+                    (str(message_row.get("guild_id") or "").strip() if message_row else None)
+                ),
+                author_id=actor.get("author_id"),
+                author_name=actor.get("author_name"),
+                author_display=actor.get("author_display"),
+                author_is_bot=bool(actor.get("author_is_bot")),
+                original_created_at=original_created_at,
+                change_type=change_type,
+                emoji_key=(emoji_meta or {}).get("emoji_key"),
+                emoji_name=(emoji_meta or {}).get("emoji_name"),
+                emoji_display=(emoji_meta or {}).get("emoji_display"),
+                emoji_id=(emoji_meta or {}).get("emoji_id"),
+                message_author_id=message_author_id,
+                message_author_name=message_author_name or None,
+                message_author_display=message_author_name or None,
+            )
+        except Exception as e:
+            logger.debug("Discord reaction change-log insert failed: %s", e)
+
     def _is_bot_mention_only_content(self, content: str) -> bool:
         """
         True when content is only a ping to this bot (no actual text).
@@ -1127,6 +1650,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "author_is_bot": bool(getattr(author, "bot", False)),
             "content": normalized_content,
             "attachments_json": [self._attachment_payload(att) for att in (message.attachments or [])],
+            "reactions_json": self._message_reaction_summary(message),
             "created_at": created_at,
             "edited_at": edited_at,
             "deleted": False,
@@ -1239,7 +1763,144 @@ class DiscordAdapter(BasePlatformAdapter):
         ordered = channels[start:] + channels[:start]
         return ordered[:take], (start + take) % n
 
-    def _collect_scrape_targets(self, include_threads: bool = False) -> List[Any]:
+    @staticmethod
+    def _archive_before_datetime(ts: Optional[float]) -> Optional[datetime]:
+        if ts is None:
+            return None
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _next_archived_cursor_ts(threads: List[Any]) -> Optional[float]:
+        if not threads:
+            return None
+        stamps: List[float] = []
+        for thread in threads:
+            archive_ts = getattr(thread, "archive_timestamp", None)
+            if archive_ts is None:
+                continue
+            try:
+                stamps.append(float(archive_ts.timestamp()))
+            except Exception:
+                continue
+        if not stamps:
+            return None
+        return min(stamps) - 0.001
+
+    def _collect_thread_parent_channels(self) -> List[Any]:
+        if not DISCORD_AVAILABLE or not self._client:
+            return []
+        rows: List[Any] = []
+        for guild in getattr(self._client, "guilds", []) or []:
+            for attr in ("text_channels", "forum_channels", "media_channels"):
+                for channel in getattr(guild, attr, []) or []:
+                    if not self._is_channel_allowed(channel):
+                        continue
+                    if not callable(getattr(channel, "archived_threads", None)):
+                        continue
+                    rows.append(channel)
+
+        rows.sort(
+            key=lambda ch: (
+                str(getattr(getattr(ch, "guild", None), "id", "")),
+                str(getattr(ch, "id", "")),
+            )
+        )
+        deduped: List[Any] = []
+        seen_ids: Set[str] = set()
+        for channel in rows:
+            channel_id = str(getattr(channel, "id", "")).strip()
+            if not channel_id or channel_id in seen_ids:
+                continue
+            seen_ids.add(channel_id)
+            deduped.append(channel)
+        return deduped
+
+    async def _scan_archived_threads_mode(
+        self,
+        parent: Any,
+        *,
+        limit: int,
+        before_ts: Optional[float],
+        private: Optional[bool] = None,
+    ) -> Tuple[List[Any], Optional[float]]:
+        if not callable(getattr(parent, "archived_threads", None)):
+            return [], before_ts
+
+        kwargs: Dict[str, Any] = {"limit": max(1, int(limit))}
+        before = self._archive_before_datetime(before_ts)
+        if before is not None:
+            kwargs["before"] = before
+        if private is not None:
+            kwargs["private"] = private
+
+        try:
+            batch = [thread async for thread in parent.archived_threads(**kwargs)]
+        except Exception as e:
+            logger.debug(
+                "Discord archived-thread scan failed (parent=%s, private=%s): %s",
+                getattr(parent, "id", "unknown"),
+                private,
+                e,
+            )
+            return [], before_ts
+
+        if not batch:
+            # Reset to head once a full backward sweep reaches the end.
+            if before_ts is not None:
+                return [], None
+            return [], before_ts
+        return batch, self._next_archived_cursor_ts(batch)
+
+    async def _collect_archived_threads_from_parent(self, parent: Any) -> List[Any]:
+        if not self._archive_db:
+            return []
+
+        parent_id = str(getattr(parent, "id", "")).strip()
+        if not parent_id:
+            return []
+        state = self._archive_db.get_thread_scrape_state(parent_id)
+        limit = self._full_scrape_thread_archived_limit()
+        rows: List[Any] = []
+
+        if isinstance(parent, discord.TextChannel):
+            public_rows, next_public = await self._scan_archived_threads_mode(
+                parent,
+                limit=limit,
+                before_ts=state.get("public_before_ts"),
+                private=False,
+            )
+            private_rows, next_private = await self._scan_archived_threads_mode(
+                parent,
+                limit=limit,
+                before_ts=state.get("private_before_ts"),
+                private=True,
+            )
+            self._archive_db.upsert_thread_scrape_state(
+                parent_id,
+                public_before_ts=next_public,
+                private_before_ts=next_private,
+            )
+            rows.extend(public_rows)
+            rows.extend(private_rows)
+        else:
+            archived_rows, next_public = await self._scan_archived_threads_mode(
+                parent,
+                limit=limit,
+                before_ts=state.get("public_before_ts"),
+                private=None,
+            )
+            self._archive_db.upsert_thread_scrape_state(
+                parent_id,
+                public_before_ts=next_public,
+            )
+            rows.extend(archived_rows)
+
+        return [thread for thread in rows if self._is_channel_allowed(thread)]
+
+    async def _collect_scrape_targets(self, include_threads: bool = False) -> List[Any]:
         """Collect readable Discord channels for archive workers."""
         if not DISCORD_AVAILABLE or not self._client:
             return []
@@ -1253,6 +1914,34 @@ class DiscordAdapter(BasePlatformAdapter):
                 for thread in getattr(guild, "threads", []) or []:
                     if self._is_channel_allowed(thread):
                         rows.append(thread)
+                active_threads_getter = getattr(guild, "active_threads", None)
+                if callable(active_threads_getter):
+                    try:
+                        active_threads = await active_threads_getter()
+                    except Exception as e:
+                        logger.debug("Discord active-thread discovery failed (guild=%s): %s", getattr(guild, "id", "unknown"), e)
+                    else:
+                        for thread in active_threads or []:
+                            if self._is_channel_allowed(thread):
+                                rows.append(thread)
+
+        if include_threads and self._archive_db:
+            parent_channels = self._collect_thread_parent_channels()
+            if parent_channels:
+                batch, self._thread_parent_rr_index = self._pick_round_robin_batch(
+                    parent_channels,
+                    self._thread_parent_rr_index,
+                    self._full_scrape_thread_parent_channels_per_tick(),
+                )
+                for parent in batch:
+                    try:
+                        rows.extend(await self._collect_archived_threads_from_parent(parent))
+                    except Exception as e:
+                        logger.debug(
+                            "Discord archived-thread parent sweep failed (%s): %s",
+                            getattr(parent, "id", "unknown"),
+                            e,
+                        )
 
         # Stable ordering + de-dup by channel ID for fair round-robin selection.
         rows.sort(
@@ -1276,7 +1965,7 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _run_frontfill_tick(self) -> None:
         if not self._archive_db:
             return
-        targets = self._collect_scrape_targets(include_threads=self._full_scrape_include_threads())
+        targets = await self._collect_scrape_targets(include_threads=self._full_scrape_include_threads())
         if not targets:
             return
         batch, self._frontfill_rr_index = self._pick_round_robin_batch(
@@ -1302,7 +1991,7 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _run_backfill_tick(self) -> None:
         if not self._archive_db or not self._backfill_enabled():
             return
-        targets = self._collect_scrape_targets(include_threads=self._full_scrape_include_threads())
+        targets = await self._collect_scrape_targets(include_threads=self._full_scrape_include_threads())
         if not targets:
             return
         batch, self._backfill_rr_index = self._pick_round_robin_batch(
@@ -1570,6 +2259,11 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._bootstrap_channel_archive(message.channel)
         except Exception as e:
             logger.debug("Discord channel bootstrap failed while archiving: %s", e)
+        if isinstance(message.channel, discord.Thread):
+            try:
+                await self._ensure_thread_seed(message.channel)
+            except Exception as e:
+                logger.debug("Discord thread seed ensure failed while archiving (%s): %s", getattr(message.channel, "id", "unknown"), e)
 
         try:
             self._archive_db.upsert_message(self._message_to_archive_row(message))
@@ -1587,6 +2281,11 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._bootstrap_channel_archive(after.channel)
         except Exception as e:
             logger.debug("Discord channel bootstrap failed while archiving edit: %s", e)
+        if isinstance(after.channel, discord.Thread):
+            try:
+                await self._ensure_thread_seed(after.channel)
+            except Exception as e:
+                logger.debug("Discord thread seed ensure failed while archiving edit (%s): %s", getattr(after.channel, "id", "unknown"), e)
 
         try:
             before_row = self._message_to_archive_row(before)
@@ -1626,6 +2325,155 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("Discord turn-anchor reset failed (%s): %s", ch_id, e)
 
+    def _message_to_context_row(self, message: Any) -> Dict[str, Any]:
+        created_at = (
+            float(message.created_at.timestamp())
+            if getattr(message, "created_at", None) is not None
+            else float(datetime.now().timestamp())
+        )
+        author = getattr(message, "author", None)
+        author_id = str(getattr(author, "id", "") or "").strip() or "unknown"
+        author_name = str(getattr(author, "name", "") or "").strip() or author_id
+        content = self._materialize_message_text(message)
+        return {
+            "message_id": str(getattr(message, "id", "")),
+            "created_at": created_at,
+            "author_id": author_id,
+            "author_name": author_name,
+            "author_display": author_name,
+            "author_is_bot": bool(getattr(author, "bot", False)),
+            "content": content,
+        }
+
+    def _render_seed_payload(self, rows: List[Dict[str, Any]]) -> str:
+        if not rows:
+            return ""
+        lines: List[str] = []
+        last_hour: Optional[str] = None
+        for row in rows:
+            hour_header, line = self._format_archive_history_line(row)
+            if hour_header != last_hour:
+                lines.append(hour_header)
+                last_hour = hour_header
+            lines.append(line)
+        payload = "\n".join(lines).strip()
+        if not payload:
+            return ""
+        max_chars = max(1000, self._context_max_chars() // 2)
+        if len(payload) <= max_chars:
+            return payload
+        return "...[thread seed truncated]...\n" + payload[-max_chars:]
+
+    async def _ensure_thread_seed(self, thread: Any) -> None:
+        """
+        Ensure one-time seed metadata exists for a thread.
+
+        - Anchored text-channel thread: preload up to N parent messages before anchor.
+        - Unanchored/thread-without-parent-anchor: store blank seed.
+        """
+        if not self._archive_db or not DISCORD_AVAILABLE:
+            return
+        if not isinstance(thread, discord.Thread):
+            return
+
+        thread_id = str(getattr(thread, "id", "")).strip()
+        if not thread_id:
+            return
+        if thread_id in self._thread_seed_initialized:
+            return
+
+        existing = self._archive_db.get_thread_seed(thread_id)
+        if existing is not None:
+            self._thread_seed_initialized.add(thread_id)
+            return
+
+        parent = getattr(thread, "parent", None)
+        parent_id = str(getattr(thread, "parent_id", "")).strip() or None
+        guild = getattr(thread, "guild", None)
+        guild_id = str(getattr(guild, "id", "")).strip() or None
+
+        seed_kind = "unanchored"
+        anchor_message_id: Optional[str] = None
+        seed_text = ""
+
+        # Forum/media threads are treated as unanchored by policy.
+        if isinstance(parent, discord.TextChannel):
+            try:
+                anchor_msg = await parent.fetch_message(int(thread_id))
+            except Exception as e:
+                logger.debug("Discord thread anchor lookup failed (%s): %s", thread_id, e)
+            else:
+                seed_kind = "anchored"
+                anchor_message_id = str(getattr(anchor_msg, "id", "")).strip() or thread_id
+                seed_limit = self._thread_seed_limit()
+                rows: List[Dict[str, Any]] = []
+                try:
+                    async for hist_msg in parent.history(limit=seed_limit, oldest_first=True, before=anchor_msg):
+                        row = self._message_to_context_row(hist_msg)
+                        if row.get("author_is_bot"):
+                            continue
+                        if self._is_bot_mention_only_content(str(row.get("content") or "")):
+                            continue
+                        rows.append(row)
+                except Exception as e:
+                    logger.debug("Discord thread parent-history seed build failed (%s): %s", thread_id, e)
+                seed_text = self._render_seed_payload(rows)
+
+        self._archive_db.upsert_thread_seed(
+            thread_id=thread_id,
+            guild_id=guild_id,
+            parent_channel_id=parent_id,
+            anchor_message_id=anchor_message_id,
+            seed_text=seed_text,
+            seed_kind=seed_kind,
+        )
+        self._thread_seed_initialized.add(thread_id)
+
+    @staticmethod
+    def _format_reaction_suffix(msg: Dict[str, Any]) -> str:
+        reactions = list(msg.get("reactions") or [])
+        if not reactions:
+            return ""
+
+        candidates: List[str] = []
+        for reaction in reactions:
+            if not isinstance(reaction, dict):
+                continue
+            emoji = str(reaction.get("emoji_display") or reaction.get("emoji_name") or "").strip()
+            if not emoji:
+                continue
+
+            names: List[str] = []
+            seen_names: Set[str] = set()
+            for reactor in list(reaction.get("reactors") or []):
+                name = str(reactor.get("user_name") or reactor.get("user_id") or "").strip()
+                if not name or name in seen_names:
+                    continue
+                seen_names.add(name)
+                names.append(name)
+                if len(names) >= DiscordAdapter.MAX_INLINE_REACTION_NAMES:
+                    break
+
+            if not names:
+                continue
+
+            try:
+                total_count = max(int(reaction.get("count") or 0), len(names))
+            except (TypeError, ValueError):
+                total_count = len(names)
+            overflow = max(0, total_count - len(names))
+            if overflow > 0:
+                names.append(f"+{overflow}")
+            candidates.append(f"{emoji} ({', '.join(names)})")
+
+        if not candidates:
+            return ""
+
+        rendered = candidates[:DiscordAdapter.MAX_INLINE_REACTIONS]
+        if len(candidates) > len(rendered):
+            rendered.append(f"+{len(candidates) - len(rendered)} more")
+        return f" [reactions: {', '.join(rendered)}]"
+
     @staticmethod
     def _format_archive_history_line(msg: Dict[str, Any]) -> Tuple[str, str]:
         """
@@ -1641,8 +2489,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content = " ".join((msg.get("content") or "").split())
         if not content:
             content = "[non-text message]"
-        # if len(content) > 220:
-        #     content = content[:217] + "..."
+        content += DiscordAdapter._format_reaction_suffix(msg)
         return hour_header, f"{minute_second} <{author}>: {content}"
 
     @staticmethod
@@ -1669,6 +2516,26 @@ class DiscordAdapter(BasePlatformAdapter):
         before = " ".join((change.get("before_content") or "").split())
         after = " ".join((change.get("after_content") or "").split())
         change_type = str(change.get("change_type") or "").strip().lower()
+
+        if change_type.startswith("reaction_"):
+            target_author = (
+                change.get("message_author_display")
+                or change.get("message_author_name")
+                or change.get("message_author_id")
+                or "unknown"
+            )
+            emoji = str(change.get("emoji_display") or change.get("emoji_name") or "reaction").strip()
+            if change_type == "reaction_add":
+                detail = f"added {emoji} to {target_author}'s message"
+            elif change_type == "reaction_remove":
+                detail = f"removed {emoji} from {target_author}'s message"
+            elif change_type == "reaction_clear_emoji":
+                detail = f"cleared {emoji} reactions from {target_author}'s message"
+            elif change_type == "reaction_clear":
+                detail = f"cleared reactions from {target_author}'s message"
+            else:
+                detail = f"updated reactions on {target_author}'s message"
+            return hour_header, f"{minute_second} <{author}>: {detail}"
 
         if not before:
             before = "[non-text message]"
@@ -1743,6 +2610,7 @@ class DiscordAdapter(BasePlatformAdapter):
         fresh_limit = self._fresh_context_limit()
         window_limit = max(1, fresh_limit)
         channel_id = str(message.channel.id)
+        thread_seed_prefix = ""
 
         if not self._archive_db:
             # Fallback path (archive disabled): hit Discord history API directly.
@@ -1773,6 +2641,22 @@ class DiscordAdapter(BasePlatformAdapter):
             if block and include_channel_label:
                 self._context_header_sent_channels.add(channel_id)
             return block, False, ""
+
+        if isinstance(message.channel, discord.Thread):
+            try:
+                await self._ensure_thread_seed(message.channel)
+            except Exception as e:
+                logger.debug(
+                    "Discord thread seed ensure failed during context build (%s): %s",
+                    channel_id,
+                    e,
+                )
+            seed_row = self._archive_db.get_thread_seed(channel_id)
+            if seed_row:
+                seed_text = str(seed_row.get("seed_text") or "").strip()
+                if seed_text:
+                    seed_kind = str(seed_row.get("seed_kind") or "thread").strip() or "thread"
+                    thread_seed_prefix = f"[Thread seed | {seed_kind}]\n{seed_text}\n\n"
 
         force_fresh_window = channel_id in self._force_fresh_context_channels
         anchor = None if force_fresh_window else self._archive_db.get_turn_anchor(channel_id)
@@ -1846,10 +2730,16 @@ class DiscordAdapter(BasePlatformAdapter):
             if not self._is_bot_mention_only_content(str(row.get("content") or ""))
         ]
 
-        change_rows: List[Dict[str, Any]] = []
-        if anchor and hasattr(self._archive_db, "list_changes_since_anchor"):
+        if (not anchor or force_auto_reset or force_fresh_window) and rows:
             try:
-                change_rows = self._archive_db.list_changes_since_anchor(
+                rows = await self._hydrate_context_reaction_rows(message.channel, rows)
+            except Exception as e:
+                logger.debug("Discord reaction hydration for context failed: %s", e)
+
+        change_rows: List[Dict[str, Any]] = []
+        if anchor and hasattr(self._archive_db, "list_all_changes_since_anchor"):
+            try:
+                change_rows = self._archive_db.list_all_changes_since_anchor(
                     channel_id=channel_id,
                     anchor_message_id=anchor,
                     limit=threshold,
@@ -1864,6 +2754,8 @@ class DiscordAdapter(BasePlatformAdapter):
             self._force_fresh_context_channels.discard(channel_id)
 
         if not rows and not change_rows:
+            if thread_seed_prefix:
+                return thread_seed_prefix.strip(), force_auto_reset, reset_reason
             return "", force_auto_reset, reset_reason
 
         ch_name = getattr(message.channel, "name", str(message.channel.id))
@@ -1877,6 +2769,8 @@ class DiscordAdapter(BasePlatformAdapter):
             include_channel_label=include_channel_label,
             changes=change_rows,
         )
+        if thread_seed_prefix:
+            block = f"{thread_seed_prefix}{block}".strip()
         if block and include_channel_label:
             self._context_header_sent_channels.add(channel_id)
         return block, force_auto_reset, reset_reason
@@ -1973,6 +2867,210 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return False
+
+    def _build_fork_thread_name(self, requested_name: str = "") -> str:
+        name = str(requested_name or "").strip()
+        if not name:
+            name = f"fork-{datetime.now().strftime('%m%d-%H%M')}"
+        # Discord thread names max out at 100 chars.
+        return name[:100].strip() or f"fork-{datetime.now().strftime('%m%d-%H%M')}"
+
+    @staticmethod
+    def _parse_fork_mode_and_name(raw_args: str) -> Tuple[str, str]:
+        """
+        Parse `/fork` args into (visibility, name).
+
+        Supported modes: public, private, auto.
+        Examples:
+          - "/fork public deep-dive"
+          - "/fork private"
+          - "/fork sprint planning"  (public by default, name only)
+        """
+        args = str(raw_args or "").strip()
+        if not args:
+            return "public", ""
+
+        mode = "public"
+        name = args
+        try:
+            tokens = shlex.split(args)
+        except Exception:
+            tokens = args.split()
+        if tokens:
+            head = str(tokens[0] or "").strip().lower()
+            if head in {"public", "private", "auto"}:
+                mode = head
+                name = " ".join(tokens[1:]).strip()
+        return mode, name
+
+    def _seed_rows_from_archive(
+        self,
+        channel_id: str,
+        limit: int,
+        *,
+        exclude_message_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not self._archive_db:
+            return []
+        rows = self._archive_db.list_recent_messages(
+            channel_id=channel_id,
+            limit=max(1, int(limit)),
+            include_bots=False,
+        )
+        excluded = str(exclude_message_id or "").strip()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if excluded and str(row.get("message_id") or "").strip() == excluded:
+                continue
+            content = str(row.get("content") or "")
+            if self._is_bot_mention_only_content(content):
+                continue
+            if content.strip().lower().startswith("/fork"):
+                continue
+            out.append(row)
+        return out
+
+    async def create_fork_thread_result(
+        self,
+        event: MessageEvent,
+        requested_name: Optional[str] = None,
+        visibility: str = "auto",
+    ) -> Dict[str, Any]:
+        """
+        Create a new Discord thread and seed it with recent context from the source chat.
+
+        Visibility can be selected via command args:
+          /fork public [name]
+          /fork private [name]
+        When called via the manual `/fork` command, omitted visibility defaults
+        to public. Programmatic callers may still pass `visibility="auto"`.
+        """
+        if not DISCORD_AVAILABLE or not self._client:
+            return {"success": False, "error": "Discord adapter is not connected."}
+
+        raw = event.raw_message
+        channel = None
+        source_message = None
+        actor = None
+        if isinstance(raw, discord.Interaction):
+            channel = getattr(raw, "channel", None)
+            actor = getattr(raw, "user", None)
+        elif isinstance(raw, discord.Message):
+            channel = getattr(raw, "channel", None)
+            source_message = raw
+            actor = getattr(raw, "author", None)
+        else:
+            getter = getattr(self._client, "get_channel", None)
+            if callable(getter):
+                channel = getter(int(event.source.chat_id))
+
+        if channel is None:
+            return {"success": False, "error": "unable to resolve the source channel."}
+        if isinstance(channel, discord.DMChannel):
+            return {"success": False, "error": "Fork is only available in server channels."}
+
+        parent = channel
+        source_channel_for_seed = str(getattr(channel, "id", "")).strip()
+        if isinstance(channel, discord.Thread):
+            source_channel_for_seed = str(channel.id)
+            parent = getattr(channel, "parent", None)
+
+        if not isinstance(parent, discord.TextChannel):
+            return {"success": False, "error": "Fork currently supports text-channel threads only."}
+        if not self._is_channel_allowed(parent):
+            return {"success": False, "error": "target channel is outside the allowed Discord scope."}
+
+        fork_mode = str(visibility or "auto").strip().lower()
+        parsed_name = str(requested_name or "").strip()
+        if requested_name is None:
+            fork_mode, parsed_name = self._parse_fork_mode_and_name(
+                event.get_command_args()
+            )
+        thread_name = self._build_fork_thread_name(parsed_name)
+        is_source_text_message = (
+            source_message is not None and isinstance(source_message.channel, discord.TextChannel)
+        )
+        visibility = fork_mode
+        if visibility == "auto":
+            visibility = "public" if is_source_text_message else "private"
+        if visibility not in {"public", "private"}:
+            return {"success": False, "error": "visibility must be 'public' or 'private'."}
+
+        try:
+            if visibility == "public" and is_source_text_message:
+                created_thread = await parent.create_thread(
+                    name=thread_name,
+                    message=source_message,
+                    auto_archive_duration=parent.default_auto_archive_duration,
+                )
+                anchor_message_id = str(source_message.id)
+            elif visibility == "public":
+                actor_name = str(getattr(actor, "name", "") or "").strip()
+                anchor_text = f"Fork anchor for `{thread_name}`."
+                if actor_name:
+                    anchor_text = f"Fork anchor for `{thread_name}` by {actor_name}."
+                anchor_msg = await parent.send(anchor_text)
+                created_thread = await parent.create_thread(
+                    name=thread_name,
+                    message=anchor_msg,
+                    auto_archive_duration=parent.default_auto_archive_duration,
+                )
+                anchor_message_id = str(anchor_msg.id)
+            else:
+                created_thread = await parent.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=parent.default_auto_archive_duration,
+                    type=discord.ChannelType.private_thread,
+                    invitable=True,
+                )
+                anchor_message_id = None
+        except Exception as e:
+            logger.debug("Discord /fork thread creation failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        seed_rows = self._seed_rows_from_archive(
+            source_channel_for_seed,
+            limit=self._thread_seed_limit(),
+            exclude_message_id=event.message_id,
+        )
+        seed_text = self._render_seed_payload(seed_rows)
+        if self._archive_db:
+            self._archive_db.upsert_thread_seed(
+                thread_id=str(created_thread.id),
+                guild_id=str(getattr(getattr(created_thread, "guild", None), "id", "")) or None,
+                parent_channel_id=str(getattr(created_thread, "parent_id", "")) or None,
+                anchor_message_id=anchor_message_id,
+                seed_text=seed_text,
+                seed_kind=f"fork:{visibility}",
+            )
+        self._thread_seed_initialized.add(str(created_thread.id))
+
+        actor_name = str(getattr(actor, "name", "") or "").strip()
+        opener = "Forked conversation started."
+        if actor_name:
+            opener = f"Forked conversation started by {actor_name}."
+        if seed_text:
+            opener += f"\nSeeded with the last {len(seed_rows)} non-bot message(s) from the split point."
+        await created_thread.send(opener)
+        return {
+            "success": True,
+            "thread_id": str(created_thread.id),
+            "thread_name": str(getattr(created_thread, "name", "") or thread_name),
+            "thread_mention": f"<#{created_thread.id}>",
+            "visibility": visibility,
+            "parent_channel_id": str(getattr(created_thread, "parent_id", "") or getattr(parent, "id", "") or ""),
+        }
+
+    async def create_fork_thread(self, event: MessageEvent, raw_args: str = "") -> str:
+        visibility, requested_name = self._parse_fork_mode_and_name(raw_args)
+        result = await self.create_fork_thread_result(
+            event,
+            requested_name=requested_name or None,
+            visibility=visibility,
+        )
+        if not result.get("success"):
+            return f"Fork failed: {result.get('error', 'unknown error')}"
+        return f"Fork created ({result['visibility']}): {result['thread_mention']}"
     
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
@@ -2017,6 +3115,27 @@ class DiscordAdapter(BasePlatformAdapter):
             await self.handle_message(event)
             try:
                 await interaction.followup.send("Session reset~", ephemeral=True)
+            except Exception as e:
+                logger.debug("Discord followup failed: %s", e)
+
+        @tree.command(name="fork", description="Fork this chat into a public or private thread")
+        @discord.app_commands.describe(
+            visibility="Thread visibility",
+            name="Optional thread name",
+        )
+        async def slash_fork(
+            interaction: discord.Interaction,
+            visibility: Literal["public", "private"] = "public",
+            name: str = "",
+        ):
+            if not await self._guard_slash_channel(interaction):
+                return
+            await interaction.response.defer(ephemeral=True)
+            fork_cmd = f"/fork {visibility} {name}".strip()
+            event = self._build_slash_event(interaction, fork_cmd)
+            await self.handle_message(event)
+            try:
+                await interaction.followup.send("Fork requested~", ephemeral=True)
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
 
@@ -2109,12 +3228,14 @@ class DiscordAdapter(BasePlatformAdapter):
     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""
         is_dm = isinstance(interaction.channel, discord.DMChannel)
-        chat_type = "dm" if is_dm else "group"
+        is_thread = isinstance(interaction.channel, discord.Thread)
+        chat_type = "dm" if is_dm else ("thread" if is_thread else "group")
         chat_name = ""
         if not is_dm and hasattr(interaction.channel, "name"):
             chat_name = interaction.channel.name
-            if hasattr(interaction.channel, "guild") and interaction.channel.guild:
+            if hasattr(interaction.channel, "guild") and interaction.channel.guild and not is_thread:
                 chat_name = f"{interaction.channel.guild.name} / #{chat_name}"
+        thread_id = str(interaction.channel_id) if is_thread else None
 
         source = self.build_source(
             chat_id=str(interaction.channel_id),
@@ -2122,6 +3243,7 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=str(interaction.user.id),
             user_name=interaction.user.name,
+            thread_id=thread_id,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT

@@ -15,6 +15,8 @@ Usage:
 
 import asyncio
 import base64
+import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -80,10 +82,15 @@ if _config_path.exists():
                 "container_memory": "TERMINAL_CONTAINER_MEMORY",
                 "container_disk": "TERMINAL_CONTAINER_DISK",
                 "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+                "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
             }
             for _cfg_key, _env_var in _terminal_env_map.items():
                 if _cfg_key in _terminal_cfg:
-                    os.environ[_env_var] = str(_terminal_cfg[_cfg_key])
+                    _val = _terminal_cfg[_cfg_key]
+                    if isinstance(_val, list):
+                        os.environ[_env_var] = json.dumps(_val)
+                    else:
+                        os.environ[_env_var] = str(_val)
     except Exception:
         pass  # Non-fatal; gateway can still run with .env values
 
@@ -118,6 +125,20 @@ from model_runtime_config import load_model_runtime_config
 logger = logging.getLogger(__name__)
 
 
+def _has_context_files(path: Path) -> bool:
+    """Return True when a directory contains prompt context files."""
+    return any(
+        [
+            (path / "AGENTS.md").exists(),
+            (path / "agents.md").exists(),
+            (path / "SOUL.md").exists(),
+            (path / "soul.md").exists(),
+            (path / ".cursorrules").exists(),
+            (path / ".cursor" / "rules").is_dir(),
+        ]
+    )
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -129,6 +150,7 @@ class GatewayRunner:
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._context_cwd = self._resolve_context_cwd()
 
         # Load ephemeral config from config.yaml / env vars.
         # Both are injected at API-call time only and never persisted.
@@ -171,6 +193,19 @@ class GatewayRunner:
         # Event hook system
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
+
+    def _resolve_context_cwd(self) -> str:
+        """Pick the host directory used for gateway prompt context files."""
+        cwd = Path.cwd().resolve()
+        hermes_home = _hermes_home.resolve()
+
+        # Gateway is often launched from the install repo or a service manager.
+        # If the workspace under HERMES_HOME carries AGENTS/SOUL/Cursor rules,
+        # prefer that over the process cwd so prompt context matches the gateway
+        # workspace instead of the launch directory.
+        if _has_context_files(hermes_home):
+            return str(hermes_home)
+        return str(cwd)
     
     def _flush_memories_before_reset(self, old_entry):
         """Prompt the agent to save memories/skills before an auto-reset.
@@ -200,6 +235,7 @@ class GatewayRunner:
                 quiet_mode=True,
                 enabled_toolsets=["memory", "skills"],
                 session_id=old_entry.session_id,
+                context_cwd=self._context_cwd,
             )
 
             # Build conversation history from transcript
@@ -231,6 +267,25 @@ class GatewayRunner:
             logger.info("Pre-reset save completed for session %s", old_entry.session_id)
         except Exception as e:
             logger.debug("Pre-reset save failed for session %s: %s", old_entry.session_id, e)
+
+    @staticmethod
+    def _sandbox_task_id_for_session(
+        session_key: Optional[str],
+        source: SessionSource,
+        session_id: str,
+    ) -> str:
+        """Build a stable, filesystem-safe task_id for persistent sandboxes.
+
+        Keying by session_key keeps one sandbox per chat/session even when
+        session_id rotates on /new or automatic resets.
+        """
+        stable_key = session_key or (
+            f"{source.platform.value}:{source.chat_type}:{source.chat_id}:"
+            f"{source.thread_id or ''}:{source.user_id or ''}:{session_id}"
+        )
+        digest = hashlib.sha1(stable_key.encode("utf-8")).hexdigest()[:24]
+        platform = source.platform.value if source and source.platform else "unknown"
+        return f"gw-{platform}-{digest}"
     
     @staticmethod
     def _load_prefill_messages() -> List[Dict[str, Any]]:
@@ -500,6 +555,62 @@ class GatewayRunner:
         if "enable_dms" in pconfig.extra:
             return self._is_truthy(pconfig.extra.get("enable_dms"))
         return True
+
+    def _discord_cost_summary_enabled(self) -> bool:
+        """Return whether Discord responses should include a request cost footer."""
+        env_val = (os.getenv("DISCORD_COST_SUMMARY_ENABLED", "") or "").strip()
+        if env_val:
+            return self._is_truthy(env_val)
+
+        pconfig = self.config.platforms.get(Platform.DISCORD)
+        if not pconfig or not isinstance(pconfig.extra, dict):
+            return True
+        if "cost_summary_enabled" in pconfig.extra:
+            return self._is_truthy(pconfig.extra.get("cost_summary_enabled"))
+        return True
+
+    @staticmethod
+    def _format_cost_usd(cost_usd: float) -> str:
+        """Format USD cost compactly without hiding sub-cent request costs."""
+        abs_cost = abs(cost_usd)
+        if abs_cost >= 0.01:
+            return f"${cost_usd:.2f}"
+        if abs_cost >= 0.001:
+            return f"${cost_usd:.3f}"
+        return f"${cost_usd:.4f}"
+
+    def _append_request_cost_summary(
+        self,
+        response: str,
+        agent_result: Dict[str, Any],
+        source: SessionSource,
+    ) -> str:
+        """Append a Discord-only request cost footer when usage data includes USD cost."""
+        if not response or source.platform != Platform.DISCORD:
+            return response
+        if not self._discord_cost_summary_enabled():
+            return response
+
+        usage = agent_result.get("request_usage") or {}
+        if not isinstance(usage, dict):
+            return response
+
+        raw_cost = usage.get("cost_usd")
+        if raw_cost is None:
+            return response
+
+        try:
+            cost_usd = float(raw_cost)
+        except (TypeError, ValueError):
+            return response
+
+        summary = f"-# {self._format_cost_usd(cost_usd)} USD spent"
+        trimmed = response.rstrip()
+        if trimmed.endswith(summary):
+            return response
+        if not trimmed:
+            return summary
+        return f"{trimmed}\n\n{summary}"
     
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -693,6 +804,9 @@ class GatewayRunner:
         
         if command == "undo":
             return await self._handle_undo_command(event)
+
+        if command == "fork":
+            return await self._handle_fork_command(event)
         
         if command in ["sethome", "set-home"]:
             return await self._handle_set_home_command(event)
@@ -738,6 +852,9 @@ class GatewayRunner:
         
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context)
+        auto_fork_note = self._discord_auto_fork_prompt_note(source)
+        if auto_fork_note:
+            context_prompt = f"{context_prompt}\n\n{auto_fork_note}"
         extra_context = (getattr(event, "extra_context", "") or "").strip()
         
         # If the previous session expired and was auto-reset, prepend a notice
@@ -881,6 +998,18 @@ class GatewayRunner:
                     message_payload = message_text
 
         try:
+            delivery_state = {
+                "chat_id": source.chat_id,
+                "reply_to": event.message_id,
+                "thread_result": None,
+                "thread_source": None,
+                "thread_session_id": None,
+                "thread_session_key": None,
+                "transcript_notice": None,
+                "main_notice": None,
+                "main_notice_sent": False,
+                "thread_transcript_recorded": False,
+            }
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -897,11 +1026,19 @@ class GatewayRunner:
                 history=history,
                 source=source,
                 session_id=session_entry.session_id,
-                session_key=session_key
+                session_key=session_key,
+                event=event,
+                delivery_state=delivery_state,
             )
             
             response = agent_result.get("final_response", "")
+            delivery_response = self._append_request_cost_summary(
+                response=response,
+                agent_result=agent_result,
+                source=source,
+            )
             agent_messages = agent_result.get("messages", [])
+            use_delivery_response = True
             
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -957,6 +1094,57 @@ class GatewayRunner:
                 if len(agent_messages) > history_input_len
                 else []
             )
+            tool_defs = agent_result.get("tools", []) or []
+
+            main_channel_response = response
+            transcript_notice = None
+            fork_request = None
+            if response and delivery_state.get("thread_result") and delivery_state.get("thread_source"):
+                thread_result = delivery_state["thread_result"]
+                thread_source = delivery_state["thread_source"]
+                thread_mention = str(thread_result.get("thread_mention") or f"<#{thread_result['thread_id']}>")
+                transcript_notice = str(
+                    delivery_state.get("transcript_notice") or f"[Continued in thread {thread_mention}]"
+                )
+                setattr(event, "_response_chat_id", str(delivery_state.get("chat_id") or thread_result["thread_id"]))
+                setattr(event, "_response_reply_to_message_id", delivery_state.get("reply_to"))
+                new_messages = self._rewrite_transcript_for_fork_notice(
+                    new_messages,
+                    transcript_notice=transcript_notice,
+                    thread_mention=thread_mention,
+                )
+                if not delivery_state.get("thread_transcript_recorded"):
+                    self._append_thread_fork_transcript(
+                        thread_source=thread_source,
+                        original_source=source,
+                        message_text=message_text,
+                        response=response,
+                        tool_defs=tool_defs,
+                    )
+                    delivery_state["thread_transcript_recorded"] = True
+                main_channel_response = response
+            else:
+                fork_request = self._extract_fork_thread_request(new_messages)
+            if response and not delivery_state.get("thread_result") and fork_request:
+                auto_fork = await self._route_auto_fork_response(
+                    event=event,
+                    source=source,
+                    message_text=message_text,
+                    response=response,
+                    delivery_response=delivery_response,
+                    tool_defs=tool_defs,
+                    fork_request=fork_request,
+                )
+                if auto_fork:
+                    setattr(event, "_response_handled", True)
+                    transcript_notice = auto_fork["transcript_notice"]
+                    new_messages = self._rewrite_transcript_for_fork_notice(
+                        new_messages,
+                        transcript_notice=transcript_notice,
+                        thread_mention=str(auto_fork["thread_result"]["thread_mention"]),
+                    )
+                    main_channel_response = auto_fork["main_notice"]
+                    use_delivery_response = False
             
             # If no new messages found (edge case), fall back to simple user/assistant
             if not new_messages:
@@ -964,10 +1152,11 @@ class GatewayRunner:
                     session_entry.session_id,
                     {"role": "user", "content": message_text, "timestamp": ts}
                 )
-                if response:
+                assistant_text = transcript_notice or main_channel_response or response
+                if assistant_text:
                     self.session_store.append_to_transcript(
                         session_entry.session_id,
-                        {"role": "assistant", "content": response, "timestamp": ts}
+                        {"role": "assistant", "content": assistant_text, "timestamp": ts}
                     )
             else:
                 for msg in new_messages:
@@ -981,9 +1170,16 @@ class GatewayRunner:
                     )
             
             # Update session
-            self.session_store.update_session(session_entry.session_key)
+            request_usage = agent_result.get("request_usage") or {}
+            input_tokens = int(request_usage.get("prompt_tokens", 0) or 0)
+            output_tokens = int(request_usage.get("completion_tokens", 0) or 0)
+            self.session_store.update_session(
+                session_entry.session_key,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
             
-            return response
+            return delivery_response if use_delivery_response else main_channel_response
             
         except Exception as e:
             logger.exception("Agent error in session %s", session_key)
@@ -1026,6 +1222,7 @@ class GatewayRunner:
                             quiet_mode=True,
                             enabled_toolsets=["memory"],
                             session_id=old_entry.session_id,
+                            context_cwd=self._context_cwd,
                         )
                         # Build simple message list from transcript
                         msgs = []
@@ -1091,6 +1288,364 @@ class GatewayRunner:
         ]
         
         return "\n".join(lines)
+
+    async def _handle_fork_command(self, event: MessageEvent) -> str:
+        """Handle /fork command for Discord threads."""
+        source = event.source
+        if source.platform != Platform.DISCORD:
+            return "Fork is only available on Discord."
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None:
+            return "Fork failed: Discord adapter is not available."
+
+        creator = getattr(adapter, "create_fork_thread", None)
+        if not callable(creator):
+            return "Fork failed: this Discord adapter build does not support /fork."
+
+        try:
+            return await creator(event, event.get_command_args())
+        except Exception as e:
+            logger.debug("Discord /fork command failed: %s", e)
+            return f"Fork failed: {e}"
+
+    def _discord_auto_fork_prompt_note(self, source: SessionSource) -> str:
+        """Return Discord auto-fork guidance when the tool is available."""
+        if source.platform != Platform.DISCORD or source.chat_type not in {"group", "channel"}:
+            return ""
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        checker = getattr(adapter, "is_auto_fork_available", None)
+        if not callable(checker) or not checker(source):
+            return ""
+
+        return (
+            "[Discord routing note: Keep answers in the main channel by default. "
+            "Use the `fork_thread` tool only when the discussion mainly benefits "
+            "one person or is likely to become a long side thread that would "
+            "lower channel signal-to-noise. After calling `fork_thread`, write "
+            "your final response normally for the new thread. The gateway will "
+            "post the substantive answer in that thread and leave a short "
+            "handoff note in the main channel if configured.]"
+        )
+
+    @staticmethod
+    def _extract_fork_thread_request(messages: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+        """Extract the most recent successful fork_thread tool request from new messages."""
+        tool_names: Dict[str, str] = {}
+        request: Optional[Dict[str, str]] = None
+
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                for call in msg.get("tool_calls", []) or []:
+                    call_id = str(call.get("id") or "").strip()
+                    function = call.get("function") or {}
+                    function_name = str(function.get("name") or "").strip()
+                    if call_id and function_name:
+                        tool_names[call_id] = function_name
+                continue
+
+            if msg.get("role") != "tool":
+                continue
+
+            tool_call_id = str(msg.get("tool_call_id") or "").strip()
+            if not tool_call_id or tool_names.get(tool_call_id) != "fork_thread":
+                continue
+
+            try:
+                payload = json.loads(msg.get("content") or "{}")
+            except Exception:
+                continue
+
+            if not payload.get("success") or not payload.get("requested"):
+                continue
+
+            request = {
+                "title": str(payload.get("title") or "").strip(),
+                "visibility": str(payload.get("visibility") or "auto").strip().lower() or "auto",
+                "reason": str(payload.get("reason") or "").strip(),
+            }
+
+        return request
+
+    @staticmethod
+    def _rewrite_transcript_for_fork_notice(
+        new_messages: List[Dict[str, Any]],
+        transcript_notice: str,
+        thread_mention: str,
+    ) -> List[Dict[str, Any]]:
+        """Replace the final assistant text with a short thread-handoff note."""
+        rewritten = [dict(msg) for msg in new_messages]
+
+        for index in range(len(rewritten) - 1, -1, -1):
+            msg = rewritten[index]
+            if msg.get("role") != "assistant" or "tool_calls" in msg:
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                updated = dict(msg)
+                updated["content"] = transcript_notice
+                updated["forked_to_thread"] = thread_mention
+                rewritten[index] = updated
+                return rewritten
+
+        rewritten.append(
+            {
+                "role": "assistant",
+                "content": transcript_notice,
+                "forked_to_thread": thread_mention,
+            }
+        )
+        return rewritten
+
+    def _append_thread_fork_transcript(
+        self,
+        *,
+        thread_source: SessionSource,
+        original_source: SessionSource,
+        message_text: str,
+        response: str,
+        tool_defs: List[Dict[str, Any]],
+    ) -> None:
+        """Seed the new thread session with the forked user turn and assistant reply."""
+        thread_entry = self.session_store.get_or_create_session(thread_source)
+        thread_history = self.session_store.load_transcript(thread_entry.session_id)
+        ts = datetime.now().isoformat()
+
+        if not thread_history:
+            self.session_store.append_to_transcript(
+                thread_entry.session_id,
+                {
+                    "role": "session_meta",
+                    "tools": tool_defs or [],
+                    "model": os.getenv("HERMES_MODEL", ""),
+                    "platform": thread_source.platform.value if thread_source.platform else "",
+                    "timestamp": ts,
+                },
+            )
+
+        origin_label = original_source.chat_name or original_source.chat_id
+        user_content = message_text
+        if origin_label:
+            user_content = f"[Forked from {origin_label}] {message_text}".strip()
+
+        self.session_store.append_to_transcript(
+            thread_entry.session_id,
+            {"role": "user", "content": user_content, "timestamp": ts},
+        )
+        self.session_store.append_to_transcript(
+            thread_entry.session_id,
+            {"role": "assistant", "content": response, "timestamp": ts},
+        )
+        self.session_store.update_session(thread_entry.session_key)
+
+    @staticmethod
+    def _build_thread_source(
+        source: SessionSource,
+        thread_result: Dict[str, Any],
+    ) -> SessionSource:
+        thread_id = str(thread_result.get("thread_id") or "").strip()
+        return SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=thread_id,
+            chat_name=str(thread_result.get("thread_name") or thread_id),
+            chat_type="thread",
+            user_id=source.user_id,
+            user_name=source.user_name,
+            thread_id=thread_id,
+        )
+
+    async def _activate_live_fork_thread(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        delivery_state: Dict[str, Any],
+        title: str,
+        visibility: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """Create the fork thread immediately and switch live delivery to it."""
+        if delivery_state.get("thread_result"):
+            result = dict(delivery_state["thread_result"])
+            result.update(
+                {
+                    "success": True,
+                    "requested": True,
+                    "already_forked": True,
+                    "reason": reason,
+                }
+            )
+            return result
+
+        if source.platform != Platform.DISCORD or source.chat_type not in {"group", "channel"}:
+            return {"success": False, "error": "fork_thread is only available in Discord server channels."}
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter:
+            return {"success": False, "error": "Discord adapter is not available."}
+
+        checker = getattr(adapter, "is_auto_fork_available", None)
+        if not callable(checker) or not checker(source):
+            return {"success": False, "error": "Automatic thread forking is not enabled for this channel."}
+
+        creator = getattr(adapter, "create_fork_thread_result", None)
+        if not callable(creator):
+            return {"success": False, "error": "This Discord adapter build does not support thread forking."}
+
+        try:
+            thread_result = await creator(
+                event,
+                requested_name=title or "",
+                visibility=visibility or "auto",
+            )
+        except Exception as e:
+            logger.debug("Discord live fork thread creation failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+        if not thread_result.get("success"):
+            return {
+                "success": False,
+                "error": str(thread_result.get("error") or "Thread creation failed."),
+            }
+
+        thread_source = self._build_thread_source(source, thread_result)
+        thread_entry = self.session_store.get_or_create_session(thread_source)
+
+        delivery_state["thread_result"] = thread_result
+        delivery_state["thread_source"] = thread_source
+        delivery_state["thread_session_id"] = thread_entry.session_id
+        delivery_state["thread_session_key"] = thread_entry.session_key
+        thread_chat_id = str(thread_result["thread_id"])
+        delivery_state["chat_id"] = thread_chat_id
+        delivery_state["reply_to"] = None
+        thread_mention = str(thread_result.get("thread_mention") or f"<#{thread_result['thread_id']}>")
+        delivery_state["transcript_notice"] = f"[Continued in thread {thread_mention}]"
+        setattr(event, "_response_chat_id", thread_chat_id)
+        setattr(event, "_response_reply_to_message_id", None)
+
+        active_aliases = list(getattr(event, "_active_session_aliases", []) or [])
+        if thread_chat_id not in active_aliases:
+            active_aliases.append(thread_chat_id)
+            setattr(event, "_active_session_aliases", active_aliases)
+
+        active_sessions = getattr(adapter, "_active_sessions", None)
+        if isinstance(active_sessions, dict):
+            original_event = active_sessions.get(source.chat_id)
+            if original_event is not None:
+                active_sessions[thread_chat_id] = original_event
+
+        notice_enabled = getattr(adapter, "auto_fork_main_channel_notice_enabled", None)
+        main_notice = None
+        if not callable(notice_enabled) or notice_enabled():
+            main_notice = f"Taking this to a thread: {thread_mention}"
+            try:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=main_notice,
+                    reply_to=event.message_id,
+                )
+                delivery_state["main_notice_sent"] = True
+            except Exception as e:
+                logger.debug("Discord live fork main-channel notice failed: %s", e)
+        delivery_state["main_notice"] = main_notice
+
+        payload = dict(thread_result)
+        payload.update(
+            {
+                "success": True,
+                "requested": True,
+                "title": title,
+                "visibility": str(thread_result.get("visibility") or visibility or "auto"),
+                "reason": reason,
+                "redirect_final_response": True,
+                "main_channel_notice": main_notice is not None,
+            }
+        )
+        return payload
+
+    async def _route_auto_fork_response(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        message_text: str,
+        response: str,
+        delivery_response: str,
+        tool_defs: List[Dict[str, Any]],
+        fork_request: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        """Create a Discord thread, deliver the full response there, and return notice metadata."""
+        if source.platform != Platform.DISCORD or source.chat_type not in {"group", "channel"}:
+            return None
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter:
+            return None
+
+        checker = getattr(adapter, "is_auto_fork_available", None)
+        if not callable(checker) or not checker(source):
+            return None
+
+        creator = getattr(adapter, "create_fork_thread_result", None)
+        if not callable(creator):
+            return None
+
+        try:
+            thread_result = await creator(
+                event,
+                requested_name=fork_request.get("title", ""),
+                visibility=fork_request.get("visibility", "auto"),
+            )
+        except Exception as e:
+            logger.debug("Discord auto-fork thread creation failed: %s", e)
+            return None
+
+        if not thread_result.get("success"):
+            logger.debug("Discord auto-fork rejected: %s", thread_result.get("error"))
+            return None
+
+        delivered = await adapter.deliver_response(
+            chat_id=str(thread_result["thread_id"]),
+            response=delivery_response or response,
+        )
+        if not delivered:
+            logger.warning(
+                "Discord auto-fork created thread %s but failed to deliver the response there",
+                thread_result.get("thread_id"),
+            )
+            return None
+
+        thread_source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=str(thread_result["thread_id"]),
+            chat_name=str(thread_result.get("thread_name") or thread_result["thread_id"]),
+            chat_type="thread",
+            user_id=source.user_id,
+            user_name=source.user_name,
+            thread_id=str(thread_result["thread_id"]),
+        )
+        self._append_thread_fork_transcript(
+            thread_source=thread_source,
+            original_source=source,
+            message_text=message_text,
+            response=response,
+            tool_defs=tool_defs,
+        )
+
+        thread_mention = str(thread_result.get("thread_mention") or f"<#{thread_result['thread_id']}>")
+        transcript_notice = f"[Continued in thread {thread_mention}]"
+
+        notice_enabled = getattr(adapter, "auto_fork_main_channel_notice_enabled", None)
+        main_notice = None
+        if not callable(notice_enabled) or notice_enabled():
+            main_notice = f"Taking this to a thread: {thread_mention}"
+
+        return {
+            "thread_result": thread_result,
+            "transcript_notice": transcript_notice,
+            "main_notice": main_notice,
+        }
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent."""
@@ -1118,6 +1673,7 @@ class GatewayRunner:
             "`/personality [name]` — Set a personality\n"
             "`/retry` — Retry your last message\n"
             "`/undo` — Remove the last exchange\n"
+            "`/fork [public|private] [name]` — Fork this Discord chat into a new thread (public by default)\n"
             "`/sethome` — Set this chat as the home channel\n"
             "`/help` — Show this message"
         )
@@ -1317,12 +1873,21 @@ class GatewayRunner:
         """Set environment variables for the current session."""
         os.environ["HERMES_SESSION_PLATFORM"] = context.source.platform.value
         os.environ["HERMES_SESSION_CHAT_ID"] = context.source.chat_id
+        os.environ["HERMES_SESSION_CHAT_TYPE"] = context.source.chat_type
         if context.source.chat_name:
             os.environ["HERMES_SESSION_CHAT_NAME"] = context.source.chat_name
-    
+        if context.source.thread_id:
+            os.environ["HERMES_SESSION_THREAD_ID"] = context.source.thread_id
+
     def _clear_session_env(self) -> None:
         """Clear session environment variables."""
-        for var in ["HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME"]:
+        for var in [
+            "HERMES_SESSION_PLATFORM",
+            "HERMES_SESSION_CHAT_ID",
+            "HERMES_SESSION_CHAT_TYPE",
+            "HERMES_SESSION_CHAT_NAME",
+            "HERMES_SESSION_THREAD_ID",
+        ]:
             if var in os.environ:
                 del os.environ[var]
 
@@ -1364,6 +1929,47 @@ class GatewayRunner:
         value = (value or "").strip().lower()
         return value.startswith("data:image/")
 
+    def _normalize_data_image_url(self, value: str) -> str:
+        """
+        Normalize `data:image/...;base64,...` URLs so declared MIME matches bytes.
+
+        Returns the original value when parsing/decoding is not possible.
+        """
+        data_url = str(value or "").strip()
+        if not self._is_data_image_url(data_url):
+            return data_url
+
+        try:
+            header, encoded = data_url.split(",", 1)
+        except ValueError:
+            return data_url
+
+        lower_header = header.lower()
+        if ";base64" not in lower_header:
+            return data_url
+
+        declared_mime = lower_header[5:].split(";", 1)[0].strip()
+        cleaned_encoded = re.sub(r"\s+", "", encoded)
+        try:
+            raw = base64.b64decode(cleaned_encoded, validate=True)
+        except Exception:
+            return data_url
+
+        resolved_mime = self._resolve_image_mime(
+            raw=raw,
+            declared_mime=declared_mime,
+            name_hint="data-url",
+        )
+        if not resolved_mime or resolved_mime == declared_mime:
+            return data_url
+
+        logger.debug(
+            "Normalized data URL image MIME mismatch: declared=%s, resolved=%s",
+            declared_mime,
+            resolved_mime,
+        )
+        return f"data:{resolved_mime};base64,{cleaned_encoded}"
+
     @staticmethod
     def _is_gif_media(path: str, media_type: str) -> bool:
         mtype = (media_type or "").split(";", 1)[0].strip().lower()
@@ -1371,6 +1977,63 @@ class GatewayRunner:
             return True
         path_no_query = (path or "").split("?", 1)[0].lower()
         return path_no_query.endswith(".gif")
+
+    @staticmethod
+    def _sniff_image_mime(raw: bytes) -> Optional[str]:
+        """Best-effort MIME detection from image file signatures."""
+        if not raw:
+            return None
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if raw.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if raw.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            return "image/webp"
+        if raw.startswith(b"BM"):
+            return "image/bmp"
+        if raw.startswith((b"II*\x00", b"MM\x00*")):
+            return "image/tiff"
+        if len(raw) >= 12 and raw[4:8] == b"ftyp":
+            brand = raw[8:12]
+            if brand in (b"avif", b"avis"):
+                return "image/avif"
+            if brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"):
+                return "image/heic"
+        return None
+
+    @classmethod
+    def _resolve_image_mime(
+        cls,
+        raw: bytes,
+        declared_mime: str,
+        name_hint: str,
+    ) -> str:
+        """Resolve a safe data-URL MIME, preferring sniffed bytes when available."""
+        declared = str(declared_mime or "").split(";", 1)[0].strip().lower()
+        if not declared.startswith("image/") or declared in ("image/*", "image/x-discord-emoji"):
+            declared = ""
+
+        sniffed = cls._sniff_image_mime(raw)
+        if sniffed:
+            if declared and declared != sniffed:
+                logger.debug(
+                    "Image MIME mismatch for %s: declared=%s, sniffed=%s; using sniffed",
+                    name_hint,
+                    declared,
+                    sniffed,
+                )
+            return sniffed
+
+        if declared:
+            return declared
+
+        guessed, _ = mimetypes.guess_type(name_hint)
+        guessed = str(guessed or "").split(";", 1)[0].strip().lower()
+        if guessed.startswith("image/") and guessed != "image/*":
+            return guessed
+        return "image/jpeg"
 
     @staticmethod
     def _emoji_name_from_media_type(media_type: str) -> str:
@@ -1469,11 +2132,12 @@ class GatewayRunner:
             if p.stat().st_size > 8 * 1024 * 1024:
                 logger.warning("Skipping oversized local image for multimodal payload: %s", p)
                 return None
-            mime_type = str(media_type or "").split(";", 1)[0].strip().lower()
-            if not mime_type.startswith("image/") or mime_type == "image/*":
-                guessed, _ = mimetypes.guess_type(p.name)
-                mime_type = guessed or "image/jpeg"
             raw = p.read_bytes()
+            mime_type = self._resolve_image_mime(
+                raw=raw,
+                declared_mime=media_type,
+                name_hint=p.name,
+            )
             encoded = base64.b64encode(raw).decode("ascii")
             return f"data:{mime_type};base64,{encoded}"
         except Exception as e:
@@ -1499,12 +2163,12 @@ class GatewayRunner:
                     logger.warning("Skipping oversized remote image for multimodal payload: %s", url)
                     return None
                 header_mime = str(resp.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
-            mime_type = header_mime
-            if not mime_type.startswith("image/"):
-                mime_type = str(media_type or "").split(";", 1)[0].strip().lower()
-            if not mime_type.startswith("image/") or mime_type == "image/*":
-                guessed, _ = mimetypes.guess_type(urllib.parse.urlparse(url).path)
-                mime_type = guessed or "image/jpeg"
+            declared_mime = header_mime if header_mime.startswith("image/") else media_type
+            mime_type = self._resolve_image_mime(
+                raw=raw,
+                declared_mime=declared_mime,
+                name_hint=urllib.parse.urlparse(url).path,
+            )
             encoded = base64.b64encode(raw).decode("ascii")
             return f"data:{mime_type};base64,{encoded}"
         except Exception as e:
@@ -1516,11 +2180,11 @@ class GatewayRunner:
         path = (item.get("path") or "").strip()
         source_url = (item.get("source_url") or "").strip()
 
-        # Preserve existing data URLs from history as-is.
+        # Normalize existing data URLs from history/inputs so MIME matches bytes.
         if self._is_data_image_url(source_url):
-            return source_url
+            return self._normalize_data_image_url(source_url)
         if self._is_data_image_url(path):
-            return path
+            return self._normalize_data_image_url(path)
 
         # Prefer local cached files so providers that reject remote URL sources
         # still receive a valid base64-encoded image payload.
@@ -1820,7 +2484,9 @@ class GatewayRunner:
         history: List[Dict[str, Any]],
         source: SessionSource,
         session_id: str,
-        session_key: str = None
+        session_key: str = None,
+        event: Optional[MessageEvent] = None,
+        delivery_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -1836,6 +2502,21 @@ class GatewayRunner:
         """
         from run_agent import AIAgent
         import queue
+        main_loop = asyncio.get_running_loop()
+
+        if delivery_state is None:
+            delivery_state = {
+                "chat_id": source.chat_id,
+                "reply_to": getattr(event, "message_id", None),
+                "thread_result": None,
+                "thread_source": None,
+                "thread_session_id": None,
+                "thread_session_key": None,
+                "transcript_notice": None,
+                "main_notice": None,
+                "main_notice_sent": False,
+                "thread_transcript_recorded": False,
+            }
         
         # Determine toolset based on platform.
         # Check config.yaml for per-platform overrides, fallback to hardcoded defaults.
@@ -1903,6 +2584,8 @@ class GatewayRunner:
             """Callback invoked by agent when a tool is called."""
             if not progress_queue:
                 return
+            if tool_name == "fork_thread":
+                return
             
             # "new" mode: only report when tool changes
             if progress_mode == "new" and tool_name == last_tool[0]:
@@ -1941,6 +2624,7 @@ class GatewayRunner:
                 "memory": "🧠",
                 "session_search": "🔍",
                 "send_message": "📨",
+                "fork_thread": "🧵",
                 "schedule_cronjob": "⏰",
                 "list_cronjobs": "⏰",
                 "remove_cronjob": "⏰",
@@ -1970,10 +2654,11 @@ class GatewayRunner:
                 try:
                     # Non-blocking check with small timeout
                     msg = progress_queue.get_nowait()
-                    await adapter.send(chat_id=source.chat_id, content=msg)
+                    target_chat_id = str(delivery_state.get("chat_id") or source.chat_id)
+                    await adapter.send(chat_id=target_chat_id, content=msg)
                     # Restore typing indicator after sending progress message
                     await asyncio.sleep(0.3)
-                    await adapter.send_typing(source.chat_id)
+                    await adapter.send_typing(target_chat_id)
                 except queue.Empty:
                     await asyncio.sleep(0.3)  # Check again soon
                 except asyncio.CancelledError:
@@ -1981,7 +2666,8 @@ class GatewayRunner:
                     while not progress_queue.empty():
                         try:
                             msg = progress_queue.get_nowait()
-                            await adapter.send(chat_id=source.chat_id, content=msg)
+                            target_chat_id = str(delivery_state.get("chat_id") or source.chat_id)
+                            await adapter.send(chat_id=target_chat_id, content=msg)
                         except Exception:
                             break
                     return
@@ -2067,6 +2753,36 @@ class GatewayRunner:
             except Exception:
                 pass
 
+            def fork_thread_callback(title: str = "", visibility: str = "auto", reason: str = "") -> Dict[str, Any]:
+                if event is None:
+                    return {"success": False, "error": "No source event available for thread creation."}
+
+                future = asyncio.run_coroutine_threadsafe(
+                    self._activate_live_fork_thread(
+                        event=event,
+                        source=source,
+                        delivery_state=delivery_state,
+                        title=title,
+                        visibility=visibility,
+                        reason=reason,
+                    ),
+                    main_loop,
+                )
+                result = future.result(timeout=30)
+                if result.get("success"):
+                    thread_chat_id = str(delivery_state.get("chat_id") or "")
+                    thread_source = delivery_state.get("thread_source")
+                    if thread_chat_id:
+                        os.environ["HERMES_SESSION_CHAT_ID"] = thread_chat_id
+                        os.environ["HERMES_SESSION_CHAT_TYPE"] = "thread"
+                        os.environ["HERMES_SESSION_THREAD_ID"] = thread_chat_id
+                    if thread_source and getattr(thread_source, "chat_name", None):
+                        os.environ["HERMES_SESSION_CHAT_NAME"] = str(thread_source.chat_name)
+                    thread_session_key = str(delivery_state.get("thread_session_key") or "").strip()
+                    if thread_session_key:
+                        os.environ["HERMES_SESSION_KEY"] = thread_session_key
+                return result
+
             agent = AIAgent(
                 model=model,
                 api_key=api_key,
@@ -2081,10 +2797,12 @@ class GatewayRunner:
                 model_extra_body=model_extra_body,
                 session_id=session_id,
                 tool_progress_callback=progress_callback if tool_progress_enabled else None,
+                fork_thread_callback=fork_thread_callback,
                 platform=platform_key,
                 honcho_session_key=session_key,
                 session_db=self._session_db,
                 session_db_writes=False,
+                context_cwd=self._context_cwd,
             )
             
             # Store agent reference for interrupt support
@@ -2160,7 +2878,16 @@ class GatewayRunner:
             
             history_input_len = len(agent_history)
             user_payload = self._sanitize_multimodal_history_content(message)
-            result = agent.run_conversation(user_payload, conversation_history=agent_history)
+            sandbox_task_id = self._sandbox_task_id_for_session(
+                session_key=session_key,
+                source=source,
+                session_id=session_id,
+            )
+            result = agent.run_conversation(
+                user_payload,
+                conversation_history=agent_history,
+                task_id=sandbox_task_id,
+            )
             result_holder[0] = result
             
             # Return final response, or a message if something went wrong
@@ -2173,6 +2900,7 @@ class GatewayRunner:
                     "api_calls": result.get("api_calls", 0),
                     "tools": tools_holder[0] or [],
                     "history_input_len": history_input_len,
+                    "request_usage": result.get("request_usage", {}),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -2213,6 +2941,7 @@ class GatewayRunner:
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "tools": tools_holder[0] or [],
                 "history_input_len": history_input_len,
+                "request_usage": result_holder[0].get("request_usage", {}) if result_holder[0] else {},
             }
         
         # Start progress message sender if enabled
@@ -2236,19 +2965,26 @@ class GatewayRunner:
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return
-            
-            chat_id = source.chat_id
+
             while True:
                 await asyncio.sleep(0.2)  # Check every 200ms
-                # Check if adapter has a pending interrupt for this session
-                if hasattr(adapter, 'has_pending_interrupt') and adapter.has_pending_interrupt(chat_id):
-                    agent = agent_holder[0]
-                    if agent:
-                        pending_event = adapter.get_pending_message(chat_id)
-                        pending_text = pending_event.text if pending_event else None
-                        logger.debug("Interrupt detected from adapter, signaling agent...")
-                        agent.interrupt(pending_text)
-                        break
+                chat_ids = [source.chat_id]
+                current_chat_id = str(delivery_state.get("chat_id") or "").strip()
+                if current_chat_id and current_chat_id not in chat_ids:
+                    chat_ids.append(current_chat_id)
+
+                for chat_id in chat_ids:
+                    if hasattr(adapter, 'has_pending_interrupt') and adapter.has_pending_interrupt(chat_id):
+                        agent = agent_holder[0]
+                        if agent:
+                            pending_event = adapter.get_pending_message(chat_id)
+                            pending_text = pending_event.text if pending_event else None
+                            logger.debug("Interrupt detected from adapter, signaling agent...")
+                            agent.interrupt(pending_text)
+                            break
+                else:
+                    continue
+                break
         
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
         
@@ -2264,7 +3000,16 @@ class GatewayRunner:
             # Get pending message from adapter if interrupted
             pending = None
             if result and result.get("interrupted") and adapter:
-                pending_event = adapter.get_pending_message(source.chat_id)
+                pending_chat_ids = [source.chat_id]
+                current_chat_id = str(delivery_state.get("chat_id") or "").strip()
+                if current_chat_id and current_chat_id not in pending_chat_ids:
+                    pending_chat_ids.append(current_chat_id)
+
+                pending_event = None
+                for chat_id in pending_chat_ids:
+                    pending_event = adapter.get_pending_message(chat_id)
+                    if pending_event:
+                        break
                 if pending_event:
                     pending = pending_event.text
                 elif result.get("interrupt_message"):
@@ -2291,7 +3036,9 @@ class GatewayRunner:
                     history=updated_history,
                     source=source,
                     session_id=session_id,
-                    session_key=session_key
+                    session_key=session_key,
+                    event=event,
+                    delivery_state=delivery_state,
                 )
         finally:
             # Stop progress sender and interrupt monitor

@@ -173,8 +173,14 @@ TOOLSETS = {
     },
 
     "discord_search": {
-        "description": "Search local Discord channel archive with FTS5",
+        "description": "Run read-only SQL against the local Discord archive",
         "tools": ["discord_search"],
+        "includes": []
+    },
+
+    "discord_routing": {
+        "description": "Discord channel-routing tools such as moving a deep-dive into a fresh thread",
+        "tools": ["fork_thread"],
         "includes": []
     },
     
@@ -240,7 +246,7 @@ TOOLSETS = {
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
         "tools": _HERMES_CORE_TOOLS,
-        "includes": []
+        "includes": ["discord_routing"]
     },
     
     "hermes-whatsapp": {

@@ -117,6 +117,24 @@ Automatic filesystem snapshots after each agent loop iteration so the user can r
 
 ---
 
+## 9. Discord Reply Metadata Persistence + Retrieval 💬
+
+**Status:** Not started
+**Priority:** Medium
+
+Persist Discord reply/reference metadata in archive storage so "A replied to B and tagged @hermes" can be queried from stored history and included in default context.
+
+**Scope:**
+- Add idempotent archive migration (no DB wipe required): `reply_to_message_id`, `reply_to_channel_id`, `reply_to_guild_id`, optional `reply_to_author_id`, optional `mentioned_user_ids_json`
+- Update Discord ingestion to capture `message.reference` and mention IDs into archive rows
+- Update archive read/query paths and search tool output to expose reply linkage
+- Update default context formatter to show reply relationship when present
+- Add one-time backfill/reindex script to re-upsert message history and fill new columns for existing rows
+
+**Note:** DB wipe + full rescrape is optional fallback, not the primary path. Prefer migration + backfill.
+
+---
+
 ## Implementation Priority Order
 
 ### Tier 1: Next Up
@@ -133,3 +151,4 @@ Automatic filesystem snapshots after each agent loop iteration so the user can r
 5. Session Branching / Checkpoints -- #7
 6. Filesystem Checkpointing / Rollback -- #8
 7. Signal Integration -- #4
+8. Discord Reply Metadata Persistence + Retrieval -- #9

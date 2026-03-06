@@ -9,6 +9,7 @@ runs at a time if multiple processes overlap.
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -41,6 +42,139 @@ _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+_CONTEXT_FILES = ("AGENTS.md", "SOUL.md", ".cursorrules")
+
+
+def _has_context_files(path: Path) -> bool:
+    """Return True when the workspace carries prompt context files."""
+    return any((path / name).exists() for name in _CONTEXT_FILES)
+
+
+def _resolve_context_cwd() -> str:
+    """Pick the directory used for prompt context discovery."""
+    cwd = Path.cwd().resolve()
+    hermes_home = _hermes_home.resolve()
+    if _has_context_files(hermes_home):
+        return str(hermes_home)
+    return str(cwd)
+
+
+def _bridge_terminal_config_from_yaml() -> None:
+    """Mirror terminal config.yaml settings into TERMINAL_* env vars."""
+    config_path = _hermes_home / "config.yaml"
+    if not config_path.exists():
+        return
+
+    try:
+        import yaml
+
+        with config_path.open(encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except Exception:
+        return
+
+    terminal_cfg = config.get("terminal", {})
+    if not isinstance(terminal_cfg, dict):
+        return
+
+    env_map = {
+        "backend": "TERMINAL_ENV",
+        "cwd": "TERMINAL_CWD",
+        "timeout": "TERMINAL_TIMEOUT",
+        "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
+        "docker_image": "TERMINAL_DOCKER_IMAGE",
+        "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
+        "modal_image": "TERMINAL_MODAL_IMAGE",
+        "ssh_host": "TERMINAL_SSH_HOST",
+        "ssh_user": "TERMINAL_SSH_USER",
+        "ssh_port": "TERMINAL_SSH_PORT",
+        "ssh_key": "TERMINAL_SSH_KEY",
+        "container_cpu": "TERMINAL_CONTAINER_CPU",
+        "container_memory": "TERMINAL_CONTAINER_MEMORY",
+        "container_disk": "TERMINAL_CONTAINER_DISK",
+        "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+        "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
+    }
+
+    for cfg_key, env_var in env_map.items():
+        if cfg_key not in terminal_cfg:
+            continue
+        value = terminal_cfg[cfg_key]
+        if isinstance(value, list):
+            os.environ[env_var] = json.dumps(value)
+        else:
+            os.environ[env_var] = str(value)
+
+
+def _normalize_terminal_env() -> None:
+    """Apply messaging terminal env defaults for cron runs."""
+    _bridge_terminal_config_from_yaml()
+    messaging_cwd = os.getenv("MESSAGING_CWD")
+    if messaging_cwd:
+        os.environ["TERMINAL_CWD"] = messaging_cwd
+    elif not os.getenv("TERMINAL_CWD"):
+        os.environ["TERMINAL_CWD"] = str(Path.home())
+
+
+def _select_api_key(target_base_url: str, provider_hint: str = "") -> str:
+    """Pick the credential that matches the effective provider endpoint."""
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    provider_hint = (provider_hint or "").strip().lower()
+    target_base = (target_base_url or "").lower()
+
+    if provider_hint == "openrouter" or "openrouter.ai" in target_base:
+        return openrouter_key or openai_key
+    return openai_key or openrouter_key
+
+
+def _render_job_output(
+    *,
+    job_name: str,
+    job_id: str,
+    schedule_display: str,
+    prompt: str,
+    run_time: str,
+    response: str = "",
+    error: str = "",
+    traceback_text: str = "",
+) -> str:
+    """Render a saved cron output document."""
+    if error:
+        error_block = error
+        if traceback_text:
+            error_block = f"{error}\n\n{traceback_text}"
+        return f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Run Time:** {run_time}
+**Schedule:** {schedule_display}
+
+## Prompt
+
+{prompt}
+
+## Error
+
+```
+{error_block}
+```
+"""
+
+    return f"""# Cron Job: {job_name}
+
+**Job ID:** {job_id}
+**Run Time:** {run_time}
+**Schedule:** {schedule_display}
+
+## Prompt
+
+{prompt}
+
+## Response
+
+{response}
+"""
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -172,11 +306,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="utf-8")
         except UnicodeDecodeError:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
+        _normalize_terminal_env()
 
         model = os.getenv("HERMES_MODEL", "anthropic/claude-opus-4.6")
-        # Custom endpoint (OPENAI_*) takes precedence, matching CLI behavior
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
         base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        api_key = _select_api_key(base_url)
         model_extra_body = None
 
         try:
@@ -188,6 +322,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             model = resolved.model
             base_url = resolved.base_url
+            api_key = _select_api_key(base_url, resolved.provider)
             model_extra_body = resolved.extra_body
             if resolved.provider == "nous":
                 try:
@@ -206,55 +341,54 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             base_url=base_url,
             model_extra_body=model_extra_body,
             quiet_mode=True,
-            session_id=f"cron_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            session_id=f"cron_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            context_cwd=_resolve_context_cwd(),
         )
         
         result = agent.run_conversation(prompt)
-        
-        final_response = result.get("final_response", "")
-        if not final_response:
-            final_response = "(No response generated)"
-        
-        output = f"""# Cron Job: {job_name}
 
-**Job ID:** {job_id}
-**Run Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-**Schedule:** {job.get('schedule_display', 'N/A')}
+        final_response = (result.get("final_response") or "").strip()
+        agent_error = (result.get("error") or "").strip()
+        run_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-## Prompt
+        if result.get("failed") or agent_error or not final_response:
+            error_msg = agent_error or "No response generated"
+            logger.error("Job '%s' failed: %s", job_name, error_msg)
+            output = _render_job_output(
+                job_name=job_name,
+                job_id=job_id,
+                schedule_display=job.get("schedule_display", "N/A"),
+                prompt=prompt,
+                run_time=run_time,
+                error=error_msg,
+            )
+            return False, output, "", error_msg
 
-{prompt}
+        output = _render_job_output(
+            job_name=job_name,
+            job_id=job_id,
+            schedule_display=job.get("schedule_display", "N/A"),
+            prompt=prompt,
+            run_time=run_time,
+            response=final_response,
+        )
 
-## Response
-
-{final_response}
-"""
-        
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.error("Job '%s' failed: %s", job_name, error_msg)
-        
-        output = f"""# Cron Job: {job_name} (FAILED)
 
-**Job ID:** {job_id}
-**Run Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-**Schedule:** {job.get('schedule_display', 'N/A')}
-
-## Prompt
-
-{prompt}
-
-## Error
-
-```
-{error_msg}
-
-{traceback.format_exc()}
-```
-"""
+        output = _render_job_output(
+            job_name=job_name,
+            job_id=job_id,
+            schedule_display=job.get("schedule_display", "N/A"),
+            prompt=prompt,
+            run_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            error=error_msg,
+            traceback_text=traceback.format_exc(),
+        )
         return False, output, "", error_msg
 
     finally:

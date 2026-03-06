@@ -2,13 +2,31 @@
 
 import asyncio
 import base64
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+
+
+def test_gateway_prefers_hermes_home_for_context_files(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "workspace"
+    hermes_home.mkdir()
+    (hermes_home / "AGENTS.md").write_text("workspace rules")
+
+    launch_dir = tmp_path / "launch"
+    launch_dir.mkdir()
+    monkeypatch.chdir(launch_dir)
+    monkeypatch.setattr("gateway.run._hermes_home", hermes_home)
+
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    assert runner._context_cwd == str(hermes_home)
 
 
 def test_reset_command_clears_discord_channel_context(tmp_path):
@@ -87,6 +105,104 @@ def test_discord_plain_text_turn_uses_context_without_duplicate_tail(tmp_path):
     assert captured["message"] == extra_context
 
 
+def test_handle_message_appends_discord_cost_summary_and_updates_tokens(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+    runner.config.platforms[Platform.DISCORD] = PlatformConfig(enabled=True, token="fake-token")
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+
+    async def _fake_run_agent(*, message, **kwargs):
+        return {
+            "final_response": "ok",
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "ok"},
+            ],
+            "history_input_len": 0,
+            "tools": [],
+            "request_usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 12,
+                "total_tokens": 42,
+                "cost_usd": 0.034,
+            },
+        }
+
+    runner._run_agent = _fake_run_agent
+
+    event = MessageEvent(
+        text="what is 3+4?",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    response = asyncio.run(runner._handle_message(event))
+
+    assert response == "ok\n\n-# $0.03 USD spent"
+    session_entry = runner.session_store.get_or_create_session(source)
+    assert session_entry.input_tokens == 30
+    assert session_entry.output_tokens == 12
+    assert session_entry.total_tokens == 42
+
+
+def test_handle_message_omits_discord_cost_summary_when_disabled(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+    runner.config.platforms[Platform.DISCORD] = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        extra={"cost_summary_enabled": False},
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+
+    async def _fake_run_agent(*, message, **kwargs):
+        return {
+            "final_response": "ok",
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "ok"},
+            ],
+            "history_input_len": 0,
+            "tools": [],
+            "request_usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 12,
+                "total_tokens": 42,
+                "cost_usd": 0.034,
+            },
+        }
+
+    runner._run_agent = _fake_run_agent
+
+    event = MessageEvent(
+        text="what is 3+4?",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    response = asyncio.run(runner._handle_message(event))
+
+    assert response == "ok"
+
+
 def test_multimodal_image_payload_prefers_local_base64_data_url(tmp_path):
     runner = GatewayRunner(
         GatewayConfig(sessions_dir=tmp_path / "sessions")
@@ -105,6 +221,66 @@ def test_multimodal_image_payload_prefers_local_base64_data_url(tmp_path):
             "source_url": "https://cdn.discordapp.com/example.png",
         }
     )
+
+    assert payload_url is not None
+    assert payload_url.startswith("data:image/png;base64,")
+    encoded = payload_url.split(",", 1)[1]
+    assert base64.b64decode(encoded) == png_bytes
+
+
+def test_multimodal_image_payload_uses_sniffed_mime_on_mismatch(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z6xkAAAAASUVORK5CYII="
+    )
+    local_image = tmp_path / "tiny.webp"
+    local_image.write_bytes(png_bytes)
+
+    payload_url = runner._resolve_image_payload_url(
+        {
+            "path": str(local_image),
+            "media_type": "image/webp;source_url=https://cdn.discordapp.com/example.webp",
+            "source_url": "https://cdn.discordapp.com/example.webp",
+        }
+    )
+
+    assert payload_url is not None
+    assert payload_url.startswith("data:image/png;base64,")
+    encoded = payload_url.split(",", 1)[1]
+    assert base64.b64decode(encoded) == png_bytes
+
+
+def test_http_image_to_data_url_uses_sniffed_mime_on_header_mismatch(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z6xkAAAAASUVORK5CYII="
+    )
+
+    class _FakeHTTPResponse:
+        def __init__(self, body: bytes):
+            self._body = body
+            self.headers = {"Content-Type": "image/webp"}
+
+        def read(self, _limit: int) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    with patch("gateway.run.urllib.request.urlopen", return_value=_FakeHTTPResponse(png_bytes)):
+        payload_url = runner._http_image_to_data_url(
+            "https://cdn.discordapp.com/example.webp",
+            media_type="image/webp",
+        )
 
     assert payload_url is not None
     assert payload_url.startswith("data:image/png;base64,")
@@ -181,6 +357,30 @@ def test_resolve_image_payload_url_preserves_existing_data_url(tmp_path):
     assert payload_url == data_url
 
 
+def test_resolve_image_payload_url_normalizes_mismatched_data_url(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z6xkAAAAASUVORK5CYII="
+    )
+    bad_data_url = "data:image/webp;base64," + base64.b64encode(png_bytes).decode("ascii")
+
+    payload_url = runner._resolve_image_payload_url(
+        {
+            "path": bad_data_url,
+            "media_type": "image/webp",
+            "source_url": "",
+        }
+    )
+
+    assert payload_url is not None
+    assert payload_url.startswith("data:image/png;base64,")
+    encoded = payload_url.split(",", 1)[1]
+    assert base64.b64decode(encoded) == png_bytes
+
+
 def test_sanitize_multimodal_history_content_keeps_data_url(tmp_path):
     runner = GatewayRunner(
         GatewayConfig(sessions_dir=tmp_path / "sessions")
@@ -192,6 +392,27 @@ def test_sanitize_multimodal_history_content_keeps_data_url(tmp_path):
     )
 
     assert sanitized == [{"type": "image_url", "image_url": {"url": data_url}}]
+
+
+def test_sanitize_multimodal_history_content_normalizes_data_url_mime(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z6xkAAAAASUVORK5CYII="
+    )
+    bad_data_url = "data:image/webp;base64," + base64.b64encode(png_bytes).decode("ascii")
+
+    sanitized = runner._sanitize_multimodal_history_content(
+        [{"type": "image_url", "image_url": {"url": bad_data_url}}]
+    )
+
+    assert sanitized[0]["type"] == "image_url"
+    normalized = sanitized[0]["image_url"]["url"]
+    assert normalized.startswith("data:image/png;base64,")
+    encoded = normalized.split(",", 1)[1]
+    assert base64.b64decode(encoded) == png_bytes
 
 
 def test_run_agent_accepts_multimodal_message_without_scope_error(tmp_path):
@@ -217,7 +438,7 @@ def test_run_agent_accepts_multimodal_message_without_scope_error(tmp_path):
         def __init__(self, **kwargs):
             self.tools = []
 
-        def run_conversation(self, user_message, conversation_history=None):
+        def run_conversation(self, user_message, conversation_history=None, task_id=None):
             assert isinstance(user_message, list)
             return {
                 "final_response": "ok",
@@ -239,3 +460,244 @@ def test_run_agent_accepts_multimodal_message_without_scope_error(tmp_path):
         )
 
     assert result["final_response"] == "ok"
+
+
+def test_extract_fork_thread_request_uses_latest_successful_tool_result(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "fork_thread", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_a",
+            "content": json.dumps(
+                {
+                    "success": True,
+                    "requested": True,
+                    "title": "deep-dive",
+                    "visibility": "private",
+                }
+            ),
+        },
+    ]
+
+    request = runner._extract_fork_thread_request(messages)
+
+    assert request == {"title": "deep-dive", "visibility": "private", "reason": ""}
+
+
+def test_handle_message_routes_auto_fork_response_to_thread(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+    runner.config.platforms[Platform.DISCORD] = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        home_channel=HomeChannel(platform=Platform.DISCORD, chat_id="ch123", name="Home"),
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+
+    sent = []
+
+    class _FakeDiscordAdapter:
+        def is_auto_fork_available(self, source):
+            return True
+
+        def auto_fork_main_channel_notice_enabled(self):
+            return True
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SimpleNamespace(success=True)
+
+        async def create_fork_thread_result(self, event, requested_name="", visibility="auto"):
+            return {
+                "success": True,
+                "thread_id": "th456",
+                "thread_name": "deep-dive",
+                "thread_mention": "<#th456>",
+                "visibility": "private",
+            }
+
+        async def deliver_response(self, chat_id, response, reply_to=None):
+            sent.append((chat_id, response, reply_to))
+            return True
+
+    runner.adapters[Platform.DISCORD] = _FakeDiscordAdapter()
+
+    async def _fake_run_agent(*, message, **kwargs):
+        return {
+            "final_response": "Long answer for the thread",
+            "messages": [
+                {"role": "user", "content": message},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "fork_thread", "arguments": "{\"title\": \"deep-dive\"}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": json.dumps(
+                        {
+                            "success": True,
+                            "requested": True,
+                            "title": "deep-dive",
+                            "visibility": "auto",
+                            "reason": "One-person deep dive",
+                        }
+                    ),
+                },
+                {"role": "assistant", "content": "Long answer for the thread"},
+            ],
+            "history_input_len": 0,
+            "tools": [{"type": "function", "function": {"name": "fork_thread"}}],
+            "request_usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 12,
+                "total_tokens": 42,
+                "cost_usd": 0.034,
+            },
+        }
+
+    runner._run_agent = _fake_run_agent
+
+    event = MessageEvent(
+        text="Can you go deep on this?",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    response = asyncio.run(runner._handle_message(event))
+
+    assert sent == [("th456", "Long answer for the thread\n\n-# $0.03 USD spent", None)]
+    assert response == "Taking this to a thread: <#th456>"
+    assert getattr(event, "_response_handled", False) is True
+
+    main_entry = runner.session_store.get_or_create_session(source)
+    main_history = runner.session_store.load_transcript(main_entry.session_id)
+    assert any(
+        msg.get("content") == "[Continued in thread <#th456>]"
+        for msg in main_history
+        if msg.get("role") == "assistant"
+    )
+
+    thread_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="th456",
+        chat_name="deep-dive",
+        chat_type="thread",
+        user_id="u123",
+        user_name="giftedgummybee",
+        thread_id="th456",
+    )
+    thread_entry = runner.session_store.get_or_create_session(thread_source)
+    thread_history = runner.session_store.load_transcript(thread_entry.session_id)
+    assert any(
+        msg.get("content") == "Long answer for the thread"
+        for msg in thread_history
+        if msg.get("role") == "assistant"
+    )
+
+
+def test_activate_live_fork_thread_switches_delivery_target_immediately(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    sent = []
+    active_event = asyncio.Event()
+
+    class _FakeDiscordAdapter:
+        _active_sessions = {"ch123": active_event}
+
+        def is_auto_fork_available(self, source):
+            return True
+
+        def auto_fork_main_channel_notice_enabled(self):
+            return True
+
+        async def create_fork_thread_result(self, event, requested_name="", visibility="auto"):
+            return {
+                "success": True,
+                "thread_id": "th789",
+                "thread_name": "deep-dive",
+                "thread_mention": "<#th789>",
+                "visibility": "private",
+            }
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            sent.append((chat_id, content, reply_to))
+            return SimpleNamespace(success=True)
+
+    runner.adapters[Platform.DISCORD] = _FakeDiscordAdapter()
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+    event = MessageEvent(
+        text="Can you go deeper?",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m123",
+    )
+    delivery_state = {
+        "chat_id": source.chat_id,
+        "reply_to": event.message_id,
+        "thread_result": None,
+        "thread_source": None,
+        "thread_session_id": None,
+        "thread_session_key": None,
+        "transcript_notice": None,
+        "main_notice": None,
+        "main_notice_sent": False,
+        "thread_transcript_recorded": False,
+    }
+
+    result = asyncio.run(
+        runner._activate_live_fork_thread(
+            event=event,
+            source=source,
+            delivery_state=delivery_state,
+            title="deep-dive",
+            visibility="private",
+            reason="One-person follow-up",
+        )
+    )
+
+    assert result["success"] is True
+    assert delivery_state["chat_id"] == "th789"
+    assert delivery_state["reply_to"] is None
+    assert getattr(event, "_response_chat_id") == "th789"
+    assert getattr(event, "_response_reply_to_message_id") is None
+    assert getattr(event, "_active_session_aliases") == ["th789"]
+    assert runner.adapters[Platform.DISCORD]._active_sessions["th789"] is active_event
+    assert sent == [("ch123", "Taking this to a thread: <#th789>", "m123")]

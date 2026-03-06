@@ -247,6 +247,12 @@ gateway:
     # Optional hard scoping for where the Discord bot is allowed to operate.
     # Leave empty to allow all guilds/channels the bot can access.
     # You can set either or both.
+    # `allowed_channel_ids` accepts a union of:
+    # - category IDs (allow all child channels/threads)
+    # - channel IDs
+    # - thread IDs
+    # Final scope is: (matched by allowed_channel_ids, if set)
+    #                 AND (matched by allowed_guild_ids, if set).
     allowed_guild_ids: []
     allowed_channel_ids: []
 

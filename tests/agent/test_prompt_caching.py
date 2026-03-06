@@ -12,6 +12,18 @@ from agent.prompt_caching import (
 MARKER = {"type": "ephemeral"}
 
 
+def _strip_cache_control(value):
+    if isinstance(value, dict):
+        return {
+            k: _strip_cache_control(v)
+            for k, v in value.items()
+            if k != "cache_control"
+        }
+    if isinstance(value, list):
+        return [_strip_cache_control(item) for item in value]
+    return value
+
+
 class TestApplyCacheMarker:
     def test_tool_message_gets_top_level_marker(self):
         msg = {"role": "tool", "content": "result"}
@@ -84,12 +96,10 @@ class TestApplyAnthropicCacheControl:
         ]
         result = apply_anthropic_cache_control(msgs)
         # System (index 0) + last 3 non-system (indices 2, 3, 4) = 4 breakpoints
-        # Index 1 (msg1) should NOT have marker
+        # Index 1 (msg1) should be normalized but should NOT have a marker
         content_1 = result[1]["content"]
-        if isinstance(content_1, str):
-            assert True  # No marker applied (still a string)
-        else:
-            assert "cache_control" not in content_1[0]
+        assert isinstance(content_1, list)
+        assert "cache_control" not in content_1[0]
 
     def test_no_system_message(self):
         msgs = [
@@ -126,3 +136,21 @@ class TestApplyAnthropicCacheControl:
             elif "cache_control" in msg:
                 count += 1
         assert count <= 4
+
+    def test_prefix_shape_stays_stable_across_turns(self):
+        first_turn = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "msg1"},
+            {"role": "assistant", "content": "msg2"},
+            {"role": "user", "content": "msg3"},
+        ]
+        second_turn = first_turn + [
+            {"role": "assistant", "content": "msg4"},
+            {"role": "tool", "content": "tool-result-1"},
+            {"role": "tool", "content": "tool-result-2"},
+        ]
+
+        first_result = apply_anthropic_cache_control(first_turn)
+        second_result = apply_anthropic_cache_control(second_turn)
+
+        assert _strip_cache_control(first_result) == _strip_cache_control(second_result[:4])

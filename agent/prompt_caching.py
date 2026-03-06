@@ -12,6 +12,16 @@ import copy
 from typing import Any, Dict, List
 
 
+def _normalize_text_content(msg: dict) -> None:
+    """Canonicalize string content into Anthropic-style text blocks."""
+    if msg.get("role") == "tool":
+        return
+
+    content = msg.get("content")
+    if isinstance(content, str):
+        msg["content"] = [{"type": "text", "text": content}]
+
+
 def _apply_cache_marker(msg: dict, cache_marker: dict) -> None:
     """Add cache_control to a single message, handling all format variations."""
     role = msg.get("role", "")
@@ -25,9 +35,8 @@ def _apply_cache_marker(msg: dict, cache_marker: dict) -> None:
         msg["cache_control"] = cache_marker
         return
 
-    if isinstance(content, str):
-        msg["content"] = [{"type": "text", "text": content, "cache_control": cache_marker}]
-        return
+    _normalize_text_content(msg)
+    content = msg.get("content")
 
     if isinstance(content, list) and content:
         last = content[-1]
@@ -49,6 +58,9 @@ def apply_anthropic_cache_control(
     messages = copy.deepcopy(api_messages)
     if not messages:
         return messages
+
+    for msg in messages:
+        _normalize_text_content(msg)
 
     marker = {"type": "ephemeral"}
     if cache_ttl == "1h":

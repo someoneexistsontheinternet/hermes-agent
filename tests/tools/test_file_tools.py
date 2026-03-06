@@ -5,6 +5,7 @@ handling without requiring a running terminal environment.
 """
 
 import json
+import importlib
 from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
@@ -69,6 +70,15 @@ class TestReadFileHandler:
         assert "error" in result
         assert "terminal not available" in result["error"]
 
+    @patch("tools.terminal_tool._get_env_config")
+    def test_rejects_host_path_on_docker_backend(self, mock_env):
+        mock_env.return_value = {"env_type": "docker"}
+
+        from tools.file_tools import read_file_tool
+        result = json.loads(read_file_tool("/Users/chen/notes/INTC/trades.md"))
+        assert "error" in result
+        assert "Host path not accessible from docker backend" in result["error"]
+
 
 class TestWriteFileHandler:
     @patch("tools.file_tools._get_file_ops")
@@ -92,6 +102,15 @@ class TestWriteFileHandler:
         result = json.loads(write_file_tool("/tmp/out.txt", "data"))
         assert "error" in result
         assert "read-only" in result["error"]
+
+    @patch("tools.terminal_tool._get_env_config")
+    def test_rejects_host_path_on_remote_backend(self, mock_env):
+        mock_env.return_value = {"env_type": "ssh"}
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool("/Users/chen/notes/out.txt", "data"))
+        assert "error" in result
+        assert "Host path not accessible from ssh backend" in result["error"]
 
 
 class TestPatchHandler:
@@ -200,3 +219,104 @@ class TestSearchHandler:
         from tools.file_tools import search_tool
         result = json.loads(search_tool(pattern="x"))
         assert "error" in result
+
+    @patch("tools.terminal_tool._get_env_config")
+    def test_rejects_host_path_search_on_docker_backend(self, mock_env):
+        mock_env.return_value = {"env_type": "docker"}
+
+        from tools.file_tools import search_tool
+        result = json.loads(search_tool(pattern="*", target="files", path="/Users/chen/notes"))
+        assert "error" in result
+        assert "Host path not accessible from docker backend" in result["error"]
+
+
+class TestGetFileOpsEnvironmentCreation:
+    def test_get_file_ops_passes_task_id_and_docker_volumes(self, monkeypatch):
+        from tools import file_tools
+        terminal_tool = importlib.import_module("tools.terminal_tool")
+
+        fake_env = MagicMock(cwd="/workspace/docker_path")
+        created = {}
+
+        monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+        monkeypatch.setattr(terminal_tool, "_last_activity", {})
+        monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+        monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            lambda: {
+                "env_type": "docker",
+                "docker_image": "test-image",
+                "cwd": "/workspace/docker_path",
+                "timeout": 180,
+                "container_cpu": 2,
+                "container_memory": 4096,
+                "container_disk": 102400,
+                "container_persistent": True,
+                "docker_volumes": ["/host/docker_path:/workspace/docker_path"],
+            },
+        )
+
+        def _fake_create_environment(**kwargs):
+            created.update(kwargs)
+            return fake_env
+
+        monkeypatch.setattr(terminal_tool, "_create_environment", _fake_create_environment)
+        monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+        monkeypatch.setattr(terminal_tool, "_check_disk_usage_warning", lambda: None)
+
+        file_ops = file_tools._get_file_ops("gw-test-docker")
+
+        assert file_ops.env is fake_env
+        assert created["task_id"] == "gw-test-docker"
+        assert created["container_config"]["docker_volumes"] == [
+            "/host/docker_path:/workspace/docker_path"
+        ]
+
+    def test_get_file_ops_passes_ssh_config(self, monkeypatch):
+        from tools import file_tools
+        terminal_tool = importlib.import_module("tools.terminal_tool")
+
+        fake_env = MagicMock(cwd="~/workspace")
+        created = {}
+
+        monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+        monkeypatch.setattr(terminal_tool, "_last_activity", {})
+        monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+        monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            lambda: {
+                "env_type": "ssh",
+                "cwd": "~/workspace",
+                "timeout": 90,
+                "ssh_host": "example.com",
+                "ssh_user": "chen",
+                "ssh_port": 2222,
+                "ssh_key": "~/.ssh/id_ed25519",
+            },
+        )
+
+        def _fake_create_environment(**kwargs):
+            created.update(kwargs)
+            return fake_env
+
+        monkeypatch.setattr(terminal_tool, "_create_environment", _fake_create_environment)
+        monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+        monkeypatch.setattr(terminal_tool, "_check_disk_usage_warning", lambda: None)
+
+        file_ops = file_tools._get_file_ops("gw-test-ssh")
+
+        assert file_ops.env is fake_env
+        assert created["task_id"] == "gw-test-ssh"
+        assert created["ssh_config"] == {
+            "host": "example.com",
+            "user": "chen",
+            "port": 2222,
+            "key": "~/.ssh/id_ed25519",
+        }
+        assert created["container_config"] is None

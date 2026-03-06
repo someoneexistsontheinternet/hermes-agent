@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS messages (
     author_is_bot INTEGER NOT NULL DEFAULT 0,
     content TEXT,
     attachments_json TEXT,
+    reactions_json TEXT,
     created_at REAL NOT NULL,
     edited_at REAL,
     deleted INTEGER NOT NULL DEFAULT 0
@@ -54,6 +55,27 @@ CREATE TABLE IF NOT EXISTS message_changes (
     change_type TEXT NOT NULL,
     before_content TEXT,
     after_content TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reaction_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL,
+    guild_id TEXT,
+    channel_id TEXT NOT NULL,
+    author_id TEXT,
+    author_name TEXT,
+    author_display TEXT,
+    author_is_bot INTEGER NOT NULL DEFAULT 0,
+    original_created_at REAL,
+    changed_at REAL NOT NULL,
+    change_type TEXT NOT NULL,
+    emoji_key TEXT,
+    emoji_name TEXT,
+    emoji_display TEXT,
+    emoji_id TEXT,
+    message_author_id TEXT,
+    message_author_name TEXT,
+    message_author_display TEXT
 );
 
 CREATE TABLE IF NOT EXISTS channel_state (
@@ -76,6 +98,24 @@ CREATE TABLE IF NOT EXISTS channel_backfill_state (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS thread_context_seed (
+    thread_id TEXT PRIMARY KEY,
+    guild_id TEXT,
+    parent_channel_id TEXT,
+    anchor_message_id TEXT,
+    seed_text TEXT,
+    seed_kind TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS thread_scrape_state (
+    parent_channel_id TEXT PRIMARY KEY,
+    public_before_ts REAL,
+    private_before_ts REAL,
+    updated_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_channel_created
     ON messages(channel_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_guild_channel_created
@@ -86,8 +126,14 @@ CREATE INDEX IF NOT EXISTS idx_message_changes_channel_changed
     ON message_changes(channel_id, changed_at);
 CREATE INDEX IF NOT EXISTS idx_message_changes_message
     ON message_changes(message_id, changed_at);
+CREATE INDEX IF NOT EXISTS idx_reaction_changes_channel_changed
+    ON reaction_changes(channel_id, changed_at);
+CREATE INDEX IF NOT EXISTS idx_reaction_changes_message
+    ON reaction_changes(message_id, changed_at);
 CREATE INDEX IF NOT EXISTS idx_channel_backfill_complete
     ON channel_backfill_state(complete, updated_at);
+CREATE INDEX IF NOT EXISTS idx_thread_seed_parent
+    ON thread_context_seed(parent_channel_id, updated_at);
 """
 
 
@@ -145,11 +191,21 @@ class DiscordArchiveDB:
     def _init_schema(self) -> None:
         cursor = self._conn.cursor()
         cursor.executescript(SCHEMA_SQL)
+        self._ensure_column("messages", "reactions_json", "TEXT")
         try:
             cursor.execute("SELECT * FROM discord_messages_fts LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(FTS_SQL)
         self._conn.commit()
+
+    def _ensure_column(self, table_name: str, column_name: str, column_ddl: str) -> None:
+        rows = self._conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        existing = {str(row["name"]) for row in rows}
+        if column_name in existing:
+            return
+        self._conn.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_ddl}"
+        )
 
     def get_channel_cursor(self, channel_id: str) -> Optional[str]:
         cursor = self._conn.execute(
@@ -200,6 +256,171 @@ class DiscordArchiveDB:
         self._conn.execute(
             "DELETE FROM channel_turn_state WHERE channel_id = ?",
             (str(channel_id),),
+        )
+        self._conn.commit()
+
+    def get_message(self, channel_id: str, message_id: str) -> Optional[Dict[str, Any]]:
+        """Return one archived message row for a channel/message pair."""
+        row = self._conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE channel_id = ? AND message_id = ?
+            LIMIT 1
+            """,
+            (str(channel_id), str(message_id)),
+        ).fetchone()
+        if not row:
+            return None
+        return self._message_row_to_dict(row)
+
+    def get_thread_seed(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        """Return persisted seed context for one thread."""
+        row = self._conn.execute(
+            """
+            SELECT
+                thread_id,
+                guild_id,
+                parent_channel_id,
+                anchor_message_id,
+                seed_text,
+                seed_kind,
+                created_at,
+                updated_at
+            FROM thread_context_seed
+            WHERE thread_id = ?
+            """,
+            (str(thread_id),),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "thread_id": row["thread_id"],
+            "guild_id": row["guild_id"],
+            "parent_channel_id": row["parent_channel_id"],
+            "anchor_message_id": row["anchor_message_id"],
+            "seed_text": row["seed_text"] or "",
+            "seed_kind": row["seed_kind"] or "",
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def upsert_thread_seed(
+        self,
+        *,
+        thread_id: str,
+        seed_text: str,
+        seed_kind: str,
+        guild_id: Optional[str] = None,
+        parent_channel_id: Optional[str] = None,
+        anchor_message_id: Optional[str] = None,
+    ) -> None:
+        """Persist one thread seed payload."""
+        tid = str(thread_id or "").strip()
+        if not tid:
+            return
+        now = time.time()
+        existing = self._conn.execute(
+            "SELECT created_at FROM thread_context_seed WHERE thread_id = ?",
+            (tid,),
+        ).fetchone()
+        created_at = float(existing["created_at"]) if existing and existing["created_at"] is not None else now
+        self._conn.execute(
+            """
+            INSERT INTO thread_context_seed(
+                thread_id, guild_id, parent_channel_id, anchor_message_id,
+                seed_text, seed_kind, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                guild_id = excluded.guild_id,
+                parent_channel_id = excluded.parent_channel_id,
+                anchor_message_id = excluded.anchor_message_id,
+                seed_text = excluded.seed_text,
+                seed_kind = excluded.seed_kind,
+                updated_at = excluded.updated_at
+            """,
+            (
+                tid,
+                str(guild_id) if guild_id is not None else None,
+                str(parent_channel_id) if parent_channel_id is not None else None,
+                str(anchor_message_id) if anchor_message_id is not None else None,
+                str(seed_text or ""),
+                str(seed_kind or "").strip().lower() or "unanchored",
+                created_at,
+                now,
+            ),
+        )
+        self._conn.commit()
+
+    def get_thread_scrape_state(self, parent_channel_id: str) -> Dict[str, Any]:
+        """Return archived-thread scan cursors for one parent channel."""
+        parent_id = str(parent_channel_id or "").strip()
+        if not parent_id:
+            return {
+                "parent_channel_id": "",
+                "public_before_ts": None,
+                "private_before_ts": None,
+                "updated_at": None,
+            }
+        row = self._conn.execute(
+            """
+            SELECT parent_channel_id, public_before_ts, private_before_ts, updated_at
+            FROM thread_scrape_state
+            WHERE parent_channel_id = ?
+            """,
+            (parent_id,),
+        ).fetchone()
+        if not row:
+            return {
+                "parent_channel_id": parent_id,
+                "public_before_ts": None,
+                "private_before_ts": None,
+                "updated_at": None,
+            }
+        return {
+            "parent_channel_id": row["parent_channel_id"],
+            "public_before_ts": float(row["public_before_ts"]) if row["public_before_ts"] is not None else None,
+            "private_before_ts": float(row["private_before_ts"]) if row["private_before_ts"] is not None else None,
+            "updated_at": float(row["updated_at"]) if row["updated_at"] is not None else None,
+        }
+
+    def upsert_thread_scrape_state(
+        self,
+        parent_channel_id: str,
+        *,
+        public_before_ts: Any = ...,
+        private_before_ts: Any = ...,
+    ) -> None:
+        """
+        Upsert archived-thread scan cursors.
+
+        Pass `...` to keep a field unchanged, or `None` to clear/reset a field.
+        """
+        parent_id = str(parent_channel_id or "").strip()
+        if not parent_id:
+            return
+        current = self.get_thread_scrape_state(parent_id)
+        next_public = (
+            current.get("public_before_ts")
+            if public_before_ts is ...
+            else (float(public_before_ts) if public_before_ts is not None else None)
+        )
+        next_private = (
+            current.get("private_before_ts")
+            if private_before_ts is ...
+            else (float(private_before_ts) if private_before_ts is not None else None)
+        )
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO thread_scrape_state(parent_channel_id, public_before_ts, private_before_ts, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(parent_channel_id) DO UPDATE SET
+                public_before_ts = excluded.public_before_ts,
+                private_before_ts = excluded.private_before_ts,
+                updated_at = excluded.updated_at
+            """,
+            (parent_id, next_public, next_private, now),
         )
         self._conn.commit()
 
@@ -395,15 +616,18 @@ class DiscordArchiveDB:
         attachments = msg.get("attachments_json")
         if attachments is not None and not isinstance(attachments, str):
             attachments = json.dumps(attachments, ensure_ascii=False)
+        reactions = msg.get("reactions_json", msg.get("reactions"))
+        if reactions is not None and not isinstance(reactions, str):
+            reactions = json.dumps(reactions, ensure_ascii=False)
 
         self._conn.execute(
             """
             INSERT INTO messages(
                 message_id, guild_id, guild_name, channel_id, channel_name, thread_id,
                 author_id, author_name, author_display, author_is_bot,
-                content, attachments_json, created_at, edited_at, deleted
+                content, attachments_json, reactions_json, created_at, edited_at, deleted
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(message_id) DO UPDATE SET
                 guild_id = excluded.guild_id,
                 guild_name = excluded.guild_name,
@@ -416,6 +640,7 @@ class DiscordArchiveDB:
                 author_is_bot = excluded.author_is_bot,
                 content = excluded.content,
                 attachments_json = excluded.attachments_json,
+                reactions_json = COALESCE(excluded.reactions_json, messages.reactions_json),
                 edited_at = excluded.edited_at,
                 deleted = excluded.deleted
             """,
@@ -432,6 +657,7 @@ class DiscordArchiveDB:
                 1 if msg.get("author_is_bot") else 0,
                 msg.get("content"),
                 attachments,
+                reactions,
                 created_at,
                 edited_at,
                 deleted,
@@ -499,6 +725,69 @@ class DiscordArchiveDB:
                 changed_ts,
                 before_content,
                 after_content,
+            ),
+        )
+        self._conn.commit()
+
+    def record_reaction_change(
+        self,
+        *,
+        message_id: str,
+        channel_id: str,
+        change_type: str,
+        changed_at: Optional[float] = None,
+        guild_id: Optional[str] = None,
+        author_id: Optional[str] = None,
+        author_name: Optional[str] = None,
+        author_display: Optional[str] = None,
+        author_is_bot: bool = False,
+        original_created_at: Optional[float] = None,
+        emoji_key: Optional[str] = None,
+        emoji_name: Optional[str] = None,
+        emoji_display: Optional[str] = None,
+        emoji_id: Optional[str] = None,
+        message_author_id: Optional[str] = None,
+        message_author_name: Optional[str] = None,
+        message_author_display: Optional[str] = None,
+    ) -> None:
+        """Record one reaction add/remove/clear event."""
+        message_id = str(message_id or "").strip()
+        channel_id = str(channel_id or "").strip()
+        change_type = str(change_type or "").strip().lower()
+        if not message_id or not channel_id or not change_type:
+            return
+
+        changed_ts = float(changed_at) if changed_at is not None else time.time()
+        original_ts = float(original_created_at) if original_created_at is not None else None
+        self._conn.execute(
+            """
+            INSERT INTO reaction_changes(
+                message_id, guild_id, channel_id,
+                author_id, author_name, author_display, author_is_bot,
+                original_created_at, changed_at, change_type,
+                emoji_key, emoji_name, emoji_display, emoji_id,
+                message_author_id, message_author_name, message_author_display
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                guild_id,
+                channel_id,
+                author_id,
+                author_name,
+                author_display,
+                1 if author_is_bot else 0,
+                original_ts,
+                changed_ts,
+                change_type,
+                emoji_key,
+                emoji_name,
+                emoji_display,
+                emoji_id,
+                message_author_id,
+                message_author_name,
+                message_author_display,
             ),
         )
         self._conn.commit()
@@ -611,6 +900,19 @@ class DiscordArchiveDB:
             except Exception:
                 attachments = []
 
+        reactions: List[Dict[str, Any]] = []
+        raw_reactions = row["reactions_json"] if "reactions_json" in row.keys() else None
+        if raw_reactions:
+            try:
+                if isinstance(raw_reactions, str):
+                    decoded = json.loads(raw_reactions)
+                else:
+                    decoded = raw_reactions
+                if isinstance(decoded, list):
+                    reactions = [entry for entry in decoded if isinstance(entry, dict)]
+            except Exception:
+                reactions = []
+
         return {
             "message_id": row["message_id"],
             "guild_id": row["guild_id"],
@@ -625,13 +927,16 @@ class DiscordArchiveDB:
             "content": row["content"] or "",
             "attachments_json": raw_attachments,
             "attachments": attachments,
+            "reactions_json": raw_reactions,
+            "reactions": reactions,
             "created_at": row["created_at"],
             "edited_at": row["edited_at"],
             "deleted": bool(row["deleted"]),
         }
 
     def _change_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
-        return {
+        keys = set(row.keys())
+        payload = {
             "id": row["id"],
             "message_id": row["message_id"],
             "guild_id": row["guild_id"],
@@ -646,6 +951,16 @@ class DiscordArchiveDB:
             "before_content": row["before_content"] or "",
             "after_content": row["after_content"] or "",
         }
+        if "emoji_key" in keys:
+            payload["emoji_key"] = row["emoji_key"] or ""
+            payload["emoji_name"] = row["emoji_name"] or ""
+            payload["emoji_display"] = row["emoji_display"] or ""
+            payload["emoji_id"] = row["emoji_id"] or ""
+        if "message_author_id" in keys:
+            payload["message_author_id"] = row["message_author_id"] or ""
+            payload["message_author_name"] = row["message_author_name"] or ""
+            payload["message_author_display"] = row["message_author_display"] or ""
+        return payload
 
     def list_recent_messages(
         self,
@@ -757,6 +1072,93 @@ class DiscordArchiveDB:
         params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
         return [self._change_row_to_dict(r) for r in rows]
+
+    def list_reaction_changes_since_anchor(
+        self,
+        channel_id: str,
+        anchor_message_id: str,
+        limit: int = 200,
+        include_bots: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return reaction events that happened after the anchor message time.
+
+        This catches reactions on older messages that would otherwise be invisible
+        in delta-only context windows.
+        """
+        limit = max(1, min(int(limit), 1000))
+        channel_id = str(channel_id)
+        anchor_message_id = str(anchor_message_id or "").strip()
+        if not anchor_message_id:
+            return []
+
+        anchor_row = self._conn.execute(
+            "SELECT created_at FROM messages WHERE channel_id = ? AND message_id = ?",
+            (channel_id, anchor_message_id),
+        ).fetchone()
+        if not anchor_row:
+            return []
+
+        where = ["channel_id = ?", "changed_at > ?"]
+        params: List[Any] = [channel_id, float(anchor_row["created_at"])]
+        if not include_bots:
+            where.append("author_is_bot = 0")
+
+        sql = f"""
+            SELECT
+                id,
+                message_id,
+                guild_id,
+                channel_id,
+                author_id,
+                author_name,
+                author_display,
+                author_is_bot,
+                original_created_at,
+                changed_at,
+                change_type,
+                '' AS before_content,
+                '' AS after_content,
+                emoji_key,
+                emoji_name,
+                emoji_display,
+                emoji_id,
+                message_author_id,
+                message_author_name,
+                message_author_display
+            FROM reaction_changes
+            WHERE {' AND '.join(where)}
+            ORDER BY changed_at ASC
+            LIMIT ?
+        """
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._change_row_to_dict(r) for r in rows]
+
+    def list_all_changes_since_anchor(
+        self,
+        channel_id: str,
+        anchor_message_id: str,
+        limit: int = 200,
+        include_bots: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return message and reaction changes ordered chronologically."""
+        limit = max(1, min(int(limit), 1000))
+        changes = self.list_changes_since_anchor(
+            channel_id=channel_id,
+            anchor_message_id=anchor_message_id,
+            limit=limit,
+            include_bots=include_bots,
+        )
+        reaction_changes = self.list_reaction_changes_since_anchor(
+            channel_id=channel_id,
+            anchor_message_id=anchor_message_id,
+            limit=limit,
+            include_bots=include_bots,
+        )
+        merged = changes + reaction_changes
+        merged.sort(key=lambda row: (float(row.get("changed_at") or 0), int(row.get("id") or 0)))
+        return merged[:limit]
 
     def count_new_non_bot_messages(
         self,

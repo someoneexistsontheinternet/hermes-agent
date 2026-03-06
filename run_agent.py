@@ -125,11 +125,13 @@ class AIAgent:
         session_id: str = None,
         tool_progress_callback: callable = None,
         clarify_callback: callable = None,
+        fork_thread_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         skip_context_files: bool = False,
+        context_cwd: str = None,
         skip_memory: bool = False,
         session_db=None,
         honcho_session_key: str = None,
@@ -162,6 +164,8 @@ class AIAgent:
             tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
             clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
                 Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
+            fork_thread_callback (callable): Callback function(title, visibility, reason) -> dict for
+                gateway-managed Discord thread forking. If None, the fork_thread tool returns an error.
             max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
             reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
                 If None, defaults to {"enabled": True, "effort": "xhigh"} for OpenRouter. Set to disable/customize reasoning.
@@ -173,6 +177,8 @@ class AIAgent:
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
+            context_cwd (str): Directory to scan for AGENTS.md, SOUL.md, and .cursorrules.
+                Defaults to the process working directory when not provided.
             honcho_session_key (str): Session key for Honcho integration (e.g., "telegram:123456" or CLI session_id).
                 When provided and Honcho is enabled in config, enables persistent cross-session user modeling.
             session_db_writes (bool): If False, disables message writes from AIAgent to SessionDB.
@@ -188,6 +194,7 @@ class AIAgent:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self.skip_context_files = skip_context_files
+        self.context_cwd = context_cwd
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -202,6 +209,7 @@ class AIAgent:
             )
         self.tool_progress_callback = tool_progress_callback
         self.clarify_callback = clarify_callback
+        self.fork_thread_callback = fork_thread_callback
         self._last_reported_tool = None  # Track for "new tool" mode
         
         # Interrupt mechanism for breaking out of tool loops
@@ -920,15 +928,69 @@ class AIAgent:
             return "***"
         return f"{key[:8]}...{key[-4:]}"
 
+    @staticmethod
+    def _env_flag_enabled(name: str) -> bool:
+        return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _should_dump_request_preflight(self) -> bool:
+        return self._env_flag_enabled("HERMES_DUMP_REQUESTS")
+
+    def _should_dump_api_exchanges(self) -> bool:
+        return any(
+            self._env_flag_enabled(name)
+            for name in ("HERMES_DUMP_API_EXCHANGES", "HERMES_DUMP_API_RESPONSES", "HERMES_DUMP_RESPONSES")
+        )
+
+    @classmethod
+    def _serialize_debug_dump_value(cls, value: Any) -> Any:
+        """Convert SDK objects into JSON-serializable data for debug dumps."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, dict):
+            return {str(k): cls._serialize_debug_dump_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [cls._serialize_debug_dump_value(v) for v in value]
+
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            for kwargs in ({}, {"mode": "json"}):
+                try:
+                    return cls._serialize_debug_dump_value(model_dump(**kwargs))
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+
+        dict_method = getattr(value, "dict", None)
+        if callable(dict_method):
+            try:
+                return cls._serialize_debug_dump_value(dict_method())
+            except Exception:
+                pass
+
+        if hasattr(value, "__dict__"):
+            data = {}
+            for key, item in vars(value).items():
+                if key.startswith("_") or callable(item):
+                    continue
+                data[key] = cls._serialize_debug_dump_value(item)
+            if data:
+                return data
+
+        return str(value)
+
     def _dump_api_request_debug(
         self,
         api_kwargs: Dict[str, Any],
         *,
         reason: str,
         error: Optional[Exception] = None,
+        response: Any = None,
     ) -> Optional[Path]:
         """
-        Dump a debug-friendly HTTP request record for chat.completions.create().
+        Dump a debug-friendly HTTP request/response record for chat.completions.create().
 
         Captures the request body from api_kwargs (excluding transport-only keys
         like timeout). Intended for debugging provider-side 4xx failures where
@@ -959,6 +1021,15 @@ class AIAgent:
                     "body": body,
                 },
             }
+
+            if response is not None:
+                response_payload: Dict[str, Any] = {
+                    "body": self._serialize_debug_dump_value(response),
+                }
+                request_id = getattr(response, "_request_id", None)
+                if request_id is not None:
+                    response_payload["request_id"] = request_id
+                dump_payload["response"] = response_payload
 
             if error is not None:
                 error_info: Dict[str, Any] = {
@@ -991,7 +1062,7 @@ class AIAgent:
                 encoding="utf-8",
             )
 
-            print(f"{self.log_prefix}🧾 Request debug dump written to: {dump_file}")
+            print(f"{self.log_prefix}🧾 API debug dump written to: {dump_file}")
 
             if os.getenv("HERMES_DUMP_REQUEST_STDOUT", "").strip().lower() in {"1", "true", "yes", "on"}:
                 print(json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str))
@@ -1285,7 +1356,7 @@ class AIAgent:
             prompt_parts.append(skills_prompt)
 
         if not self.skip_context_files:
-            context_files_prompt = build_context_files_prompt()
+            context_files_prompt = build_context_files_prompt(cwd=self.context_cwd)
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
 
@@ -1347,6 +1418,32 @@ class AIAgent:
         if result["error"] is not None:
             raise result["error"]
         return result["response"]
+
+    def _call_chat_completion(
+        self,
+        api_kwargs: Dict[str, Any],
+        *,
+        reason: str,
+        interruptible: bool = False,
+    ):
+        """Execute one chat.completions call with optional request/response dumps."""
+        if self._should_dump_request_preflight():
+            self._dump_api_request_debug(api_kwargs, reason=f"{reason}_preflight")
+
+        try:
+            if interruptible:
+                response = self._interruptible_api_call(api_kwargs)
+            else:
+                response = self.client.chat.completions.create(**api_kwargs)
+        except Exception as api_error:
+            if self._should_dump_api_exchanges():
+                self._dump_api_request_debug(api_kwargs, reason=f"{reason}_error", error=api_error)
+            raise
+
+        if self._should_dump_api_exchanges():
+            self._dump_api_request_debug(api_kwargs, reason=f"{reason}_success", response=response)
+
+        return response
 
     def _compose_extra_body(self, include_provider_preferences: bool = True) -> dict:
         """Build extra_body for OpenAI-compatible chat.completions calls."""
@@ -1523,7 +1620,8 @@ class AIAgent:
                 **self._max_tokens_param(1024),
             }
 
-            response = self.client.chat.completions.create(**api_kwargs, timeout=30.0)
+            api_kwargs["timeout"] = 30.0
+            response = self._call_chat_completion(api_kwargs, reason="memory_flush")
 
             if response.choices:
                 assistant_message = response.choices[0].message
@@ -1695,6 +1793,15 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
                     print(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+            elif function_name == "fork_thread":
+                from tools.fork_thread_tool import fork_thread_tool as _fork_thread_tool
+                function_result = _fork_thread_tool(
+                    function_args,
+                    callback=self.fork_thread_callback,
+                )
+                tool_duration = time.time() - tool_start_time
+                if self.quiet_mode:
+                    print(f"  {_get_cute_tool_message_impl('fork_thread', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
                 from tools.delegate_tool import delegate_task as _delegate_task
                 tasks_arg = function_args.get("tasks")
@@ -1744,7 +1851,8 @@ class AIAgent:
                     'vision_analyze': '👁️', 'mixture_of_agents': '🧠',
                     'skills_list': '📚', 'skill_view': '📚',
                     'schedule_cronjob': '⏰', 'list_cronjobs': '⏰', 'remove_cronjob': '⏰',
-                    'send_message': '📨', 'todo': '📋', 'memory': '🧠', 'session_search': '🔍',
+                    'send_message': '📨', 'fork_thread': '🧵',
+                    'todo': '📋', 'memory': '🧠', 'session_search': '🔍',
                     'clarify': '❓', 'execute_code': '🐍', 'delegate_task': '🔀',
                 }
                 emoji = tool_emoji_map.get(function_name, '⚡')
@@ -1853,7 +1961,7 @@ class AIAgent:
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
 
-            summary_response = self.client.chat.completions.create(**summary_kwargs)
+            summary_response = self._call_chat_completion(summary_kwargs, reason="max_iterations_summary")
 
             if summary_response.choices and summary_response.choices[0].message.content:
                 final_response = summary_response.choices[0].message.content
@@ -1985,6 +2093,18 @@ class AIAgent:
         api_call_count = 0
         final_response = None
         interrupted = False
+        request_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        request_cost_usd = 0.0
+        request_cost_known = False
+
+        def _request_usage_payload() -> Dict[str, Any]:
+            payload = dict(request_usage)
+            payload["cost_usd"] = request_cost_usd if request_cost_known else None
+            return payload
         
         # Clear any stale interrupt state at start
         self.clear_interrupt()
@@ -2088,10 +2208,11 @@ class AIAgent:
                 try:
                     api_kwargs = self._build_api_kwargs(api_messages)
 
-                    if os.getenv("HERMES_DUMP_REQUESTS", "").strip().lower() in {"1", "true", "yes", "on"}:
-                        self._dump_api_request_debug(api_kwargs, reason="preflight")
-
-                    response = self._interruptible_api_call(api_kwargs)
+                    response = self._call_chat_completion(
+                        api_kwargs,
+                        reason="run_conversation",
+                        interruptible=True,
+                    )
                     
                     api_duration = time.time() - api_start_time
                     
@@ -2164,7 +2285,8 @@ class AIAgent:
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": f"Invalid API response (choices is None/empty). Likely rate limited by provider.",
-                                "failed": True  # Mark as failure for filtering
+                                "failed": True,  # Mark as failure for filtering
+                                "request_usage": _request_usage_payload(),
                             }
                         
                         # Longer backoff for rate limiting (likely cause of None choices)
@@ -2185,6 +2307,7 @@ class AIAgent:
                                     "api_calls": api_call_count,
                                     "completed": False,
                                     "interrupted": True,
+                                    "request_usage": _request_usage_payload(),
                                 }
                             time.sleep(0.2)
                         continue  # Retry the API call
@@ -2210,7 +2333,8 @@ class AIAgent:
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Response truncated due to output length limit"
+                                "error": "Response truncated due to output length limit",
+                                "request_usage": _request_usage_payload(),
                             }
                         else:
                             # First message was truncated - mark as failed
@@ -2222,16 +2346,32 @@ class AIAgent:
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "failed": True,
-                                "error": "First response truncated due to output length limit"
+                                "error": "First response truncated due to output length limit",
+                                "request_usage": _request_usage_payload(),
                             }
                     
                     # Track actual token usage from response for context management
                     if hasattr(response, 'usage') and response.usage:
+                        prompt_tokens = int(getattr(response.usage, 'prompt_tokens', 0) or 0)
+                        completion_tokens = int(getattr(response.usage, 'completion_tokens', 0) or 0)
+                        total_tokens = int(getattr(response.usage, 'total_tokens', 0) or 0)
+                        if total_tokens <= 0:
+                            total_tokens = prompt_tokens + completion_tokens
                         usage_dict = {
-                            "prompt_tokens": getattr(response.usage, 'prompt_tokens', 0),
-                            "completion_tokens": getattr(response.usage, 'completion_tokens', 0),
-                            "total_tokens": getattr(response.usage, 'total_tokens', 0),
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
                         }
+                        request_usage["prompt_tokens"] += prompt_tokens
+                        request_usage["completion_tokens"] += completion_tokens
+                        request_usage["total_tokens"] += total_tokens
+                        raw_cost = getattr(response.usage, 'cost', None)
+                        if raw_cost is not None:
+                            try:
+                                request_cost_usd += float(raw_cost)
+                                request_cost_known = True
+                            except (TypeError, ValueError):
+                                pass
                         self.context_compressor.update_from_response(usage_dict)
                         
                         if self.verbose_logging:
@@ -2288,6 +2428,7 @@ class AIAgent:
                             "api_calls": api_call_count,
                             "completed": False,
                             "interrupted": True,
+                            "request_usage": _request_usage_payload(),
                         }
                     
                     # Check for 413 payload-too-large BEFORE generic 4xx handler.
@@ -2321,7 +2462,8 @@ class AIAgent:
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": "Request payload too large (413). Cannot compress further.",
-                                "partial": True
+                                "partial": True,
+                                "request_usage": _request_usage_payload(),
                             }
 
                     # Check for non-retryable client errors (4xx HTTP status codes).
@@ -2338,9 +2480,10 @@ class AIAgent:
                     ])
 
                     if is_client_error:
-                        self._dump_api_request_debug(
-                            api_kwargs, reason="non_retryable_client_error", error=api_error,
-                        )
+                        if not self._should_dump_api_exchanges():
+                            self._dump_api_request_debug(
+                                api_kwargs, reason="non_retryable_client_error", error=api_error,
+                            )
                         print(f"{self.log_prefix}❌ Non-retryable client error detected. Aborting immediately.")
                         print(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.")
                         logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}")
@@ -2352,6 +2495,7 @@ class AIAgent:
                             "completed": False,
                             "failed": True,
                             "error": str(api_error),
+                            "request_usage": _request_usage_payload(),
                         }
                     
                     # Check for non-retryable errors (context length exceeded)
@@ -2383,7 +2527,8 @@ class AIAgent:
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
-                                "partial": True
+                                "partial": True,
+                                "request_usage": _request_usage_payload(),
                             }
                     
                     if retry_count > max_retries:
@@ -2412,6 +2557,7 @@ class AIAgent:
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "interrupted": True,
+                                "request_usage": _request_usage_payload(),
                             }
                         time.sleep(0.2)  # Check interrupt every 200ms
             
@@ -2454,7 +2600,8 @@ class AIAgent:
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
-                            "error": "Incomplete REASONING_SCRATCHPAD after 2 retries"
+                            "error": "Incomplete REASONING_SCRATCHPAD after 2 retries",
+                            "request_usage": _request_usage_payload(),
                         }
                 
                 # Reset incomplete scratchpad counter on clean response
@@ -2501,7 +2648,8 @@ class AIAgent:
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": f"Model generated invalid tool call: {invalid_preview}"
+                                "error": f"Model generated invalid tool call: {invalid_preview}",
+                                "request_usage": _request_usage_payload(),
                             }
                     
                     # Reset retry counter on successful tool call validation
@@ -2654,7 +2802,8 @@ class AIAgent:
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Model generated only think blocks with no actual response after 3 retries"
+                                "error": "Model generated only think blocks with no actual response after 3 retries",
+                                "request_usage": _request_usage_payload(),
                             }
                     
                     # Reset retry counter on successful content
@@ -2751,6 +2900,7 @@ class AIAgent:
             "completed": completed,
             "partial": False,  # True only when stopped due to invalid tool calls
             "interrupted": interrupted,
+            "request_usage": _request_usage_payload(),
         }
         
         # Include interrupt message if one triggered the interrupt

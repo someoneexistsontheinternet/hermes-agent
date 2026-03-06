@@ -286,6 +286,36 @@ class TestMaskApiKey:
         assert "..." in result
 
 
+class TestApiDebugDumps:
+    def test_dump_includes_response_body(self, agent, tmp_path):
+        class MockResponse:
+            def model_dump(self):
+                return {
+                    "id": "resp_123",
+                    "choices": [{"message": {"content": "hello"}}],
+                    "usage": {"total_tokens": 42},
+                }
+
+        agent.logs_dir = tmp_path
+        agent.session_id = "sess_123"
+        agent.base_url = "https://example.test/v1"
+        agent.client = SimpleNamespace(api_key="test-key-1234567890")
+
+        dump_file = agent._dump_api_request_debug(
+            {"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "timeout": 30.0},
+            reason="run_conversation_success",
+            response=MockResponse(),
+        )
+
+        payload = json.loads(dump_file.read_text())
+        assert payload["reason"] == "run_conversation_success"
+        assert payload["request"]["url"] == "https://example.test/v1/chat/completions"
+        assert payload["request"]["body"]["model"] == "test-model"
+        assert "timeout" not in payload["request"]["body"]
+        assert payload["response"]["body"]["id"] == "resp_123"
+        assert payload["response"]["body"]["usage"]["total_tokens"] == 42
+
+
 # ===================================================================
 # Grup 2: State / Structure Methods
 # ===================================================================
@@ -741,6 +771,44 @@ class TestRunConversation:
         assert result["final_response"] == "Done searching"
         assert result["api_calls"] == 2
 
+    def test_request_usage_accumulates_tokens_and_cost(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
+        resp1 = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tc],
+            usage={
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "cost": 0.01234,
+            },
+        )
+        resp2 = _mock_response(
+            content="Done searching",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 50,
+                "completion_tokens": 10,
+                "total_tokens": 60,
+                "cost": 0.00456,
+            },
+        )
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["request_usage"]["prompt_tokens"] == 150
+        assert result["request_usage"]["completion_tokens"] == 30
+        assert result["request_usage"]["total_tokens"] == 180
+        assert result["request_usage"]["cost_usd"] == pytest.approx(0.0169)
+
     def test_interrupt_breaks_loop(self, agent):
         self._setup_agent(agent)
 
@@ -839,3 +907,28 @@ class TestRunConversation:
 
         assert result["final_response"] == "Image received"
         mock_save_traj.assert_called_once()
+
+    def test_dump_api_exchanges_writes_success_dump(self, agent, tmp_path, monkeypatch):
+        self._setup_agent(agent)
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        agent.logs_dir = tmp_path
+
+        monkeypatch.delenv("HERMES_DUMP_REQUESTS", raising=False)
+        monkeypatch.setenv("HERMES_DUMP_API_EXCHANGES", "1")
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        dump_files = sorted(tmp_path.glob("request_dump_*.json"))
+        assert result["final_response"] == "Final answer"
+        assert len(dump_files) == 1
+
+        payload = json.loads(dump_files[0].read_text())
+        assert payload["reason"] == "run_conversation_success"
+        assert payload["request"]["body"]["model"] == agent.model
+        assert payload["response"]["body"]["choices"][0]["message"]["content"] == "Final answer"

@@ -1517,6 +1517,7 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 | `NOUS_INFERENCE_BASE_URL` | Override Nous inference API URL |
 | `HERMES_NOUS_MIN_KEY_TTL_SECONDS` | Min agent key TTL before re-mint (default: 1800 = 30min) |
 | `HERMES_DUMP_REQUESTS` | Dump API request payloads to log files for debugging (`true`/`false`) |
+| `HERMES_DUMP_API_EXCHANGES` | Dump full request+response bodies for main agent API calls to `~/.hermes/sessions/request_dump_*.json` (`true`/`false`) |
 
 **Tool APIs:**
 | Variable | Description |

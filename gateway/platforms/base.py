@@ -112,6 +112,77 @@ def cleanup_image_cache(max_age_hours: int = 24) -> int:
     return removed
 
 
+def split_message_chunks(content: str, max_length: int = 4096) -> List[str]:
+    """
+    Split a long message into chunks, preserving code block boundaries.
+
+    Splits prefer the last newline before the limit, then the last space, and
+    only fall back to a hard split when no natural breakpoint exists.
+    """
+    if len(content) <= max_length:
+        return [content]
+
+    indicator_reserve = 10  # room for " (XX/XX)"
+    fence_close = "\n```"
+
+    chunks: List[str] = []
+    remaining = content
+    carry_lang: Optional[str] = None
+
+    while remaining:
+        prefix = f"```{carry_lang}\n" if carry_lang is not None else ""
+
+        headroom = max_length - indicator_reserve - len(prefix) - len(fence_close)
+        if headroom < 1:
+            headroom = max_length // 2
+
+        if len(prefix) + len(remaining) <= max_length - indicator_reserve:
+            chunks.append(prefix + remaining)
+            break
+
+        region = remaining[:headroom]
+        split_at = region.rfind("\n")
+        skip = 1 if split_at >= 1 else 0
+        if split_at < 1:
+            split_at = region.rfind(" ")
+            skip = 1 if split_at >= 1 else 0
+        if split_at < 1:
+            split_at = headroom
+            skip = 0
+
+        chunk_body = remaining[:split_at]
+        remaining = remaining[split_at + skip:]
+
+        full_chunk = prefix + chunk_body
+
+        in_code = carry_lang is not None
+        lang = carry_lang or ""
+        for line in full_chunk.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if in_code:
+                    in_code = False
+                    lang = ""
+                else:
+                    in_code = True
+                    tag = stripped[3:].strip()
+                    lang = tag.split()[0] if tag else ""
+
+        if in_code:
+            full_chunk += fence_close
+            carry_lang = lang
+        else:
+            carry_lang = None
+
+        chunks.append(full_chunk)
+
+    if len(chunks) > 1:
+        total = len(chunks)
+        chunks = [f"{chunk} ({i + 1}/{total})" for i, chunk in enumerate(chunks)]
+
+    return chunks
+
+
 # ---------------------------------------------------------------------------
 # Audio cache utilities
 #
@@ -538,7 +609,7 @@ class BasePlatformAdapter(ABC):
         
         return media, cleaned
     
-    async def _keep_typing(self, chat_id: str, interval: float = 2.0) -> None:
+    async def _keep_typing(self, chat_target: Any, interval: float = 2.0) -> None:
         """
         Continuously send typing indicator until cancelled.
         
@@ -547,10 +618,89 @@ class BasePlatformAdapter(ABC):
         """
         try:
             while True:
-                await self.send_typing(chat_id)
+                chat_id = chat_target() if callable(chat_target) else chat_target
+                if chat_id:
+                    await self.send_typing(str(chat_id))
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
+
+    async def deliver_response(
+        self,
+        chat_id: str,
+        response: str,
+        reply_to: Optional[str] = None,
+    ) -> bool:
+        """
+        Deliver a completed agent response to a chat, including native media.
+
+        Returns True when at least one message or attachment was delivered.
+        """
+        delivered_any = False
+
+        # Extract MEDIA:<path> tags (from TTS tool) before other processing
+        media_files, response = self.extract_media(response)
+
+        # Extract image URLs and send them as native platform attachments
+        images, text_content = self.extract_images(response)
+
+        # Send the text portion first (if any remains after extractions)
+        if text_content:
+            logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), chat_id)
+            result = await self.send(
+                chat_id=chat_id,
+                content=text_content,
+                reply_to=reply_to,
+            )
+
+            if result.success:
+                delivered_any = True
+            else:
+                print(f"[{self.name}] Failed to send response: {result.error}")
+                fallback_result = await self.send(
+                    chat_id=chat_id,
+                    content=f"(Response formatting failed, plain text:)\n\n{text_content[:3500]}",
+                    reply_to=reply_to,
+                )
+                if fallback_result.success:
+                    delivered_any = True
+                else:
+                    print(f"[{self.name}] Fallback send also failed: {fallback_result.error}")
+
+        human_delay = self._get_human_delay()
+
+        for image_url, alt_text in images:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                img_result = await self.send_image(
+                    chat_id=chat_id,
+                    image_url=image_url,
+                    caption=alt_text if alt_text else None,
+                )
+                if img_result.success:
+                    delivered_any = True
+                else:
+                    print(f"[{self.name}] Failed to send image: {img_result.error}")
+            except Exception as img_err:
+                print(f"[{self.name}] Error sending image: {img_err}")
+
+        for audio_path, _is_voice in media_files:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                voice_result = await self.send_voice(
+                    chat_id=chat_id,
+                    audio_path=audio_path,
+                )
+                if voice_result.success:
+                    delivered_any = True
+                else:
+                    print(f"[{self.name}] Failed to send voice: {voice_result.error}")
+            except Exception as voice_err:
+                print(f"[{self.name}] Error sending voice: {voice_err}")
+
+        return delivered_any
     
     async def handle_message(self, event: MessageEvent) -> None:
         """
@@ -603,91 +753,61 @@ class BasePlatformAdapter(ABC):
         # Create interrupt event for this session
         interrupt_event = asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+        response_target_getter = lambda: str(
+            getattr(event, "_response_chat_id", event.source.chat_id) or event.source.chat_id
+        )
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id))
+        typing_task = asyncio.create_task(self._keep_typing(response_target_getter))
         
         try:
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            handled_externally = bool(getattr(event, "_response_handled", False))
             
             # Send response if any
-            if not response:
+            if not response and not handled_externally:
                 logger.warning("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
-                # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
-                
-                # Extract image URLs and send them as native platform attachments
-                images, text_content = self.extract_images(response)
-                
-                # Send the text portion first (if any remains after extractions)
-                if text_content:
-                    logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
-                    result = await self.send(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=event.message_id
-                    )
-                    
-                    # Log send failures (don't raise - user already saw tool progress)
-                    if not result.success:
-                        print(f"[{self.name}] Failed to send response: {result.error}")
-                        # Try sending without markdown as fallback
-                        fallback_result = await self.send(
-                            chat_id=event.source.chat_id,
-                            content=f"(Response formatting failed, plain text:)\n\n{text_content[:3500]}",
-                            reply_to=event.message_id
-                        )
-                        if not fallback_result.success:
-                            print(f"[{self.name}] Fallback send also failed: {fallback_result.error}")
-                
-                # Human-like pacing delay between text and media
-                human_delay = self._get_human_delay()
-                
-                # Send extracted images as native attachments
-                for image_url, alt_text in images:
-                    if human_delay > 0:
-                        await asyncio.sleep(human_delay)
-                    try:
-                        img_result = await self.send_image(
-                            chat_id=event.source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text if alt_text else None,
-                        )
-                        if not img_result.success:
-                            print(f"[{self.name}] Failed to send image: {img_result.error}")
-                    except Exception as img_err:
-                        print(f"[{self.name}] Error sending image: {img_err}")
-                
-                # Send extracted audio/voice files as native attachments
-                for audio_path, is_voice in media_files:
-                    if human_delay > 0:
-                        await asyncio.sleep(human_delay)
-                    try:
-                        voice_result = await self.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=audio_path,
-                        )
-                        if not voice_result.success:
-                            print(f"[{self.name}] Failed to send voice: {voice_result.error}")
-                    except Exception as voice_err:
-                        print(f"[{self.name}] Error sending voice: {voice_err}")
+                response_chat_id = str(
+                    getattr(event, "_response_chat_id", event.source.chat_id) or event.source.chat_id
+                )
+                response_reply_to = getattr(
+                    event,
+                    "_response_reply_to_message_id",
+                    event.message_id if response_chat_id == event.source.chat_id else None,
+                )
+                await self.deliver_response(
+                    chat_id=response_chat_id,
+                    response=response,
+                    reply_to=response_reply_to,
+                )
             
             # Check if there's a pending message that was queued during our processing
-            if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+            pending_event = None
+            pending_keys = [session_key]
+            for alias_chat_id in getattr(event, "_active_session_aliases", []) or []:
+                if alias_chat_id and alias_chat_id not in pending_keys:
+                    pending_keys.append(alias_chat_id)
+            for pending_key in pending_keys:
+                if pending_key in self._pending_messages:
+                    pending_event = self._pending_messages.pop(pending_key)
+                    break
+            if pending_event is not None:
                 print(f"[{self.name}] 📨 Processing queued message from interrupt")
                 # Clean up current session before processing pending
                 if session_key in self._active_sessions:
                     del self._active_sessions[session_key]
+                for alias_chat_id in getattr(event, "_active_session_aliases", []) or []:
+                    if alias_chat_id in self._active_sessions:
+                        del self._active_sessions[alias_chat_id]
                 typing_task.cancel()
                 try:
                     await typing_task
                 except asyncio.CancelledError:
                     pass
                 # Process pending message in new background task
-                await self._process_message_background(pending_event, session_key)
+                await self._process_message_background(pending_event, pending_event.source.chat_id)
                 return  # Already cleaned up
                 
         except Exception as e:
@@ -704,6 +824,9 @@ class BasePlatformAdapter(ABC):
             # Clean up session tracking
             if session_key in self._active_sessions:
                 del self._active_sessions[session_key]
+            for alias_chat_id in getattr(event, "_active_session_aliases", []) or []:
+                if alias_chat_id in self._active_sessions:
+                    del self._active_sessions[alias_chat_id]
     
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""
@@ -771,76 +894,4 @@ class BasePlatformAdapter(ABC):
         Returns:
             List of message chunks
         """
-        if len(content) <= max_length:
-            return [content]
-
-        INDICATOR_RESERVE = 10   # room for " (XX/XX)"
-        FENCE_CLOSE = "\n```"
-
-        chunks: List[str] = []
-        remaining = content
-        # When the previous chunk ended mid-code-block, this holds the
-        # language tag (possibly "") so we can reopen the fence.
-        carry_lang: Optional[str] = None
-
-        while remaining:
-            # If we're continuing a code block from the previous chunk,
-            # prepend a new opening fence with the same language tag.
-            prefix = f"```{carry_lang}\n" if carry_lang is not None else ""
-
-            # How much body text we can fit after accounting for the prefix,
-            # a potential closing fence, and the chunk indicator.
-            headroom = max_length - INDICATOR_RESERVE - len(prefix) - len(FENCE_CLOSE)
-            if headroom < 1:
-                headroom = max_length // 2
-
-            # Everything remaining fits in one final chunk
-            if len(prefix) + len(remaining) <= max_length - INDICATOR_RESERVE:
-                chunks.append(prefix + remaining)
-                break
-
-            # Find a natural split point (prefer newlines, then spaces)
-            region = remaining[:headroom]
-            split_at = region.rfind("\n")
-            if split_at < headroom // 2:
-                split_at = region.rfind(" ")
-            if split_at < 1:
-                split_at = headroom
-
-            chunk_body = remaining[:split_at]
-            remaining = remaining[split_at:].lstrip()
-
-            full_chunk = prefix + chunk_body
-
-            # Walk the chunk line-by-line to determine whether we end
-            # inside an open code block.
-            in_code = carry_lang is not None
-            lang = carry_lang or ""
-            for line in full_chunk.split("\n"):
-                stripped = line.strip()
-                if stripped.startswith("```"):
-                    if in_code:
-                        in_code = False
-                        lang = ""
-                    else:
-                        in_code = True
-                        tag = stripped[3:].strip()
-                        lang = tag.split()[0] if tag else ""
-
-            if in_code:
-                # Close the orphaned fence so the chunk is valid on its own
-                full_chunk += FENCE_CLOSE
-                carry_lang = lang
-            else:
-                carry_lang = None
-
-            chunks.append(full_chunk)
-
-        # Append chunk indicators when the response spans multiple messages
-        if len(chunks) > 1:
-            total = len(chunks)
-            chunks = [
-                f"{chunk} ({i + 1}/{total})" for i, chunk in enumerate(chunks)
-            ]
-
-        return chunks
+        return split_message_chunks(content, max_length)

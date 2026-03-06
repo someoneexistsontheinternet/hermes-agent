@@ -126,6 +126,9 @@ class TestLoadGatewayConfigFromYaml:
             "    archive_db_path: /tmp/discord_data.sqlite\n"
             "    allowed_guild_ids: [\"111\"]\n"
             "    allowed_channel_ids: [\"222\"]\n"
+            "    auto_fork_enabled: true\n"
+            "    auto_fork_main_channel_notice: false\n"
+            "    auto_fork_allowed_channel_ids: [\"333\"]\n"
             "    full_scrape_enabled: true\n"
             "    full_scrape_interval_sec: 70\n"
             "    full_scrape_max_channels_per_tick: 9\n"
@@ -154,6 +157,9 @@ class TestLoadGatewayConfigFromYaml:
         assert extra["archive_db_path"] == "/tmp/discord_data.sqlite"
         assert extra["allowed_guild_ids"] == ["111"]
         assert extra["allowed_channel_ids"] == ["222"]
+        assert extra["auto_fork_enabled"] is True
+        assert extra["auto_fork_main_channel_notice"] is False
+        assert extra["auto_fork_allowed_channel_ids"] == ["333"]
         assert extra["full_scrape_enabled"] is True
         assert extra["full_scrape_interval_sec"] == 70
         assert extra["full_scrape_max_channels_per_tick"] == 9
@@ -210,6 +216,9 @@ class TestDiscordAdapterContextSettings:
                     "context_empty_delta_fallback": True,
                     "allowed_guild_ids": ["1", "2"],
                     "allowed_channel_ids": "10,11",
+                    "auto_fork_enabled": True,
+                    "auto_fork_main_channel_notice": False,
+                    "auto_fork_allowed_channel_ids": ["10"],
                     "full_scrape_enabled": True,
                     "full_scrape_interval_sec": 70,
                     "full_scrape_max_channels_per_tick": 9,
@@ -232,6 +241,9 @@ class TestDiscordAdapterContextSettings:
             os.environ.pop("DISCORD_CONTEXT_EMPTY_DELTA_FALLBACK", None)
             os.environ.pop("DISCORD_ALLOWED_GUILD_IDS", None)
             os.environ.pop("DISCORD_ALLOWED_CHANNEL_IDS", None)
+            os.environ.pop("DISCORD_AUTO_FORK_ENABLED", None)
+            os.environ.pop("DISCORD_AUTO_FORK_MAIN_CHANNEL_NOTICE", None)
+            os.environ.pop("DISCORD_AUTO_FORK_ALLOWED_CHANNEL_IDS", None)
             os.environ.pop("DISCORD_FULL_SCRAPE_ENABLED", None)
             os.environ.pop("DISCORD_FULL_SCRAPE_INTERVAL_SEC", None)
             os.environ.pop("DISCORD_FULL_SCRAPE_MAX_CHANNELS_PER_TICK", None)
@@ -250,6 +262,9 @@ class TestDiscordAdapterContextSettings:
             assert adapter._empty_delta_fallback_enabled() is True
             assert adapter._allowed_guild_ids() == {"1", "2"}
             assert adapter._allowed_channel_ids() == {"10", "11"}
+            assert adapter._auto_fork_enabled() is True
+            assert adapter._auto_fork_main_channel_notice() is False
+            assert adapter._auto_fork_allowed_channel_ids() == {"10"}
             assert adapter._full_scrape_enabled() is True
             assert adapter._full_scrape_interval_sec() == 70
             assert adapter._full_scrape_max_channels_per_tick() == 9
@@ -261,6 +276,38 @@ class TestDiscordAdapterContextSettings:
             assert adapter._backfill_max_channels_per_tick() == 3
             assert adapter._backfill_max_pages_per_channel() == 2
             assert adapter._scrape_progress_every_pages() == 5
+
+    def test_null_reaction_snapshot_does_not_trigger_hydration(self):
+        assert DiscordAdapter._row_needs_reaction_hydration(
+            {
+                "message_id": "123",
+                "reactions_json": None,
+                "reactions": [],
+            }
+        ) is False
+
+    def test_incomplete_reactor_snapshot_still_triggers_hydration(self):
+        assert DiscordAdapter._row_needs_reaction_hydration(
+            {
+                "message_id": "123",
+                "reactions_json": [
+                    {
+                        "emoji_name": "kek",
+                        "count": 3,
+                        "reactors": [{"user_id": "1", "user_name": "amy"}],
+                        "reactors_complete": False,
+                    }
+                ],
+                "reactions": [
+                    {
+                        "emoji_name": "kek",
+                        "count": 3,
+                        "reactors": [{"user_id": "1", "user_name": "amy"}],
+                        "reactors_complete": False,
+                    }
+                ],
+            }
+        ) is True
 
     def test_scrape_defaults_align_with_dce_style(self):
         adapter = DiscordAdapter(
@@ -283,6 +330,116 @@ class TestDiscordAdapterContextSettings:
             assert adapter._backfill_interval_sec() == 30
             assert adapter._backfill_max_channels_per_tick() == 1
             assert adapter._backfill_max_pages_per_channel() == 50
+
+    def test_allowed_channel_ids_support_category_channel_union(self):
+        adapter = DiscordAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="fake-token",
+                extra={"allowed_channel_ids": ["cat_a", "ch_z", "ch_x"]},
+            )
+        )
+
+        guild = SimpleNamespace(id="guild_1")
+        channel_x = SimpleNamespace(id="ch_x", parent_id="cat_a", category_id="cat_a", guild=guild)
+        channel_y = SimpleNamespace(id="ch_y", parent_id="cat_a", category_id="cat_a", guild=guild)
+        channel_z = SimpleNamespace(id="ch_z", parent_id="cat_b", category_id="cat_b", guild=guild)
+        channel_w = SimpleNamespace(id="ch_w", parent_id="cat_b", category_id="cat_b", guild=guild)
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DISCORD_ALLOWED_CHANNEL_IDS", None)
+            with patch.object(adapter, "_can_view_channel", return_value=True):
+                assert adapter._is_channel_allowed(channel_x) is True
+                assert adapter._is_channel_allowed(channel_y) is True
+                assert adapter._is_channel_allowed(channel_z) is True
+                assert adapter._is_channel_allowed(channel_w) is False
+
+    def test_allowed_channel_ids_match_thread_parent_category(self):
+        adapter = DiscordAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="fake-token",
+                extra={"allowed_channel_ids": ["cat_a"]},
+            )
+        )
+
+        guild = SimpleNamespace(id="guild_1")
+        parent = SimpleNamespace(id="ch_parent", parent_id="cat_a", category_id="cat_a")
+        thread = SimpleNamespace(
+            id="th_1",
+            parent_id="ch_parent",
+            category_id=None,
+            parent=parent,
+            guild=guild,
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DISCORD_ALLOWED_CHANNEL_IDS", None)
+            with patch.object(adapter, "_can_view_channel", return_value=True):
+                assert adapter._is_channel_allowed(thread) is True
+
+    def test_auto_fork_availability_checks_channel_scope(self):
+        adapter = DiscordAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="fake-token",
+                extra={
+                    "auto_fork_enabled": True,
+                    "auto_fork_allowed_channel_ids": ["ch_auto"],
+                },
+            )
+        )
+
+        source = SimpleNamespace(platform=Platform.DISCORD, chat_type="group", chat_id="ch_auto")
+        other_source = SimpleNamespace(platform=Platform.DISCORD, chat_type="group", chat_id="ch_other")
+        dm_source = SimpleNamespace(platform=Platform.DISCORD, chat_type="dm", chat_id="dm_1")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DISCORD_AUTO_FORK_ENABLED", None)
+            os.environ.pop("DISCORD_AUTO_FORK_ALLOWED_CHANNEL_IDS", None)
+            assert adapter.is_auto_fork_available(source) is True
+            assert adapter.is_auto_fork_available(other_source) is False
+            assert adapter.is_auto_fork_available(dm_source) is False
+
+    def test_parse_fork_mode_defaults_to_public(self):
+        assert DiscordAdapter._parse_fork_mode_and_name("") == ("public", "")
+        assert DiscordAdapter._parse_fork_mode_and_name("deep dive") == ("public", "deep dive")
+        assert DiscordAdapter._parse_fork_mode_and_name("private deep dive") == (
+            "private",
+            "deep dive",
+        )
+        assert DiscordAdapter._parse_fork_mode_and_name("auto deep dive") == (
+            "auto",
+            "deep dive",
+        )
+
+    def test_create_fork_thread_parses_raw_args_before_dispatch(self):
+        adapter = DiscordAdapter(
+            PlatformConfig(enabled=True, token="fake-token")
+        )
+        captured = {}
+
+        async def fake_create_fork_thread_result(event, requested_name=None, visibility="auto"):
+            captured["event"] = event
+            captured["requested_name"] = requested_name
+            captured["visibility"] = visibility
+            return {
+                "success": True,
+                "visibility": visibility,
+                "thread_mention": "<#th_public>",
+            }
+
+        adapter.create_fork_thread_result = fake_create_fork_thread_result
+        event = SimpleNamespace()
+
+        result = asyncio.run(adapter.create_fork_thread(event, "public roadmap"))
+
+        assert result == "Fork created (public): <#th_public>"
+        assert captured == {
+            "event": event,
+            "requested_name": "roadmap",
+            "visibility": "public",
+        }
 
     def test_context_header_first_turn_includes_channel_label(self):
         adapter = DiscordAdapter(
