@@ -1,5 +1,6 @@
 """Tests for cron/scheduler.py."""
 
+import json
 import os
 import sys
 import types
@@ -203,3 +204,76 @@ class TestRunJob:
         assert os.environ["TERMINAL_ENV"] == "docker"
         assert os.environ["TERMINAL_CWD"] == "/workspace/docker_path"
         assert os.environ["TERMINAL_DOCKER_VOLUMES"] == "[\"/host/data:/workspace/docker_path\"]"
+
+    def test_applies_platform_runtime_overrides_from_workspace_config(self, hermes_home, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+        (hermes_home / "prefill.json").write_text(
+            json.dumps(
+                [
+                    {"role": "user", "content": "prefill user"},
+                    {"role": "assistant", "content": "prefill assistant"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n"
+            "  reasoning_effort: none\n"
+            "  system_prompt: Keep it serious.\n"
+            "platform_toolsets:\n"
+            "  discord:\n"
+            "    - web\n"
+            "    - discord_search\n"
+            "prefill_messages_file: prefill.json\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "load_model_runtime_config",
+            lambda *args, **kwargs: ModelRuntimeConfig(
+                model="anthropic/claude-opus-4.6",
+                base_url="https://openrouter.ai/api/v1",
+                provider="openrouter",
+                extra_body=None,
+            ),
+        )
+
+        captures = []
+        _install_fake_agent(
+            monkeypatch,
+            {"final_response": "ok", "failed": False, "error": None},
+            captures,
+        )
+
+        success, _, final_response, error = scheduler.run_job(
+            {
+                "id": "job-platform",
+                "name": "Discord Job",
+                "prompt": "Ping",
+                "schedule_display": "every hour",
+                "origin": {
+                    "platform": "discord",
+                    "chat_id": "123",
+                    "chat_name": "daily-slop-summary",
+                    "chat_type": "channel",
+                    "thread_id": "456",
+                },
+            }
+        )
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert captures[0]["enabled_toolsets"] == ["web", "discord_search"]
+        assert captures[0]["reasoning_config"] == {"enabled": False}
+        assert captures[0]["platform"] == "discord"
+        assert captures[0]["ephemeral_system_prompt"] == "Keep it serious."
+        assert captures[0]["prefill_messages"] == [
+            {"role": "user", "content": "prefill user"},
+            {"role": "assistant", "content": "prefill assistant"},
+        ]
+        assert "HERMES_SESSION_PLATFORM" not in os.environ
+        assert "HERMES_SESSION_CHAT_ID" not in os.environ
+        assert "HERMES_SESSION_CHAT_TYPE" not in os.environ
+        assert "HERMES_SESSION_CHAT_NAME" not in os.environ
+        assert "HERMES_SESSION_THREAD_ID" not in os.environ

@@ -61,11 +61,12 @@ def _scan_cron_prompt(prompt: str) -> str:
 # =============================================================================
 
 def schedule_cronjob(
-    prompt: str,
-    schedule: str,
+    prompt: Optional[str] = None,
+    schedule: str = "",
     name: Optional[str] = None,
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
+    from_job_id: Optional[str] = None,
     task_id: str = None
 ) -> str:
     """
@@ -87,6 +88,7 @@ def schedule_cronjob(
     Args:
         prompt: Complete, self-contained instructions for the future agent.
                 Must include ALL context needed - the agent won't remember anything.
+                Optional when from_job_id is provided.
         schedule: When to run. Either:
                   - Duration for one-shot: "30m", "2h", "1d" (runs once)
                   - Interval: "every 30m", "every 2h" (recurring)
@@ -99,14 +101,43 @@ def schedule_cronjob(
                 - Set repeat=5 to run 5 times then auto-delete
         deliver: Where to send the output. Options:
                  - "origin": Back to where this job was created (default)
-                 - "local": Save to local files only (~/.hermes/cron/output/)
+                 - "local": Save to local files only ({HERMES_HOME}/cron/output/)
                  - "telegram": Send to Telegram home channel
                  - "discord": Send to Discord home channel
                  - "telegram:123456": Send to specific chat ID
+        from_job_id: Clone the stored prompt, name, and delivery defaults from
+                     an existing job. Use this to safely test an existing cron
+                     without manually retyping its prompt.
     
     Returns:
         JSON with job_id, next_run time, and confirmation
     """
+    source_job = None
+    cloned_origin = None
+    if from_job_id:
+        source_job = get_job(from_job_id)
+        if not source_job:
+            return json.dumps({
+                "success": False,
+                "error": f"Job with ID '{from_job_id}' not found. Use list_cronjobs to see available jobs."
+            }, indent=2)
+
+    prompt = (prompt or "").strip()
+    if source_job:
+        if not prompt:
+            prompt = source_job.get("prompt", "")
+        if name is None:
+            name = source_job.get("name")
+        if deliver is None:
+            deliver = source_job.get("deliver")
+            cloned_origin = source_job.get("origin")
+
+    if not prompt:
+        return json.dumps({
+            "success": False,
+            "error": "Either 'prompt' or 'from_job_id' is required."
+        }, indent=2)
+
     # Scan prompt for critical threats before scheduling
     scan_error = _scan_cron_prompt(prompt)
     if scan_error:
@@ -120,8 +151,12 @@ def schedule_cronjob(
         origin = {
             "platform": origin_platform,
             "chat_id": origin_chat_id,
+            "chat_type": os.getenv("HERMES_SESSION_CHAT_TYPE"),
             "chat_name": os.getenv("HERMES_SESSION_CHAT_NAME"),
+            "thread_id": os.getenv("HERMES_SESSION_THREAD_ID"),
         }
+    if cloned_origin:
+        origin = cloned_origin
     
     try:
         job = create_job(
@@ -142,7 +177,7 @@ def schedule_cronjob(
         else:
             repeat_display = f"{times} times"
         
-        return json.dumps({
+        payload = {
             "success": True,
             "job_id": job["id"],
             "name": job["name"],
@@ -151,7 +186,10 @@ def schedule_cronjob(
             "deliver": job.get("deliver", "local"),
             "next_run_at": job["next_run_at"],
             "message": f"Cronjob '{job['name']}' created. It will run {repeat_display}, deliver to {job.get('deliver', 'local')}, next at {job['next_run_at']}."
-        }, indent=2)
+        }
+        if source_job:
+            payload["cloned_from_job_id"] = source_job["id"]
+        return json.dumps(payload, indent=2)
         
     except Exception as e:
         return json.dumps({
@@ -172,6 +210,8 @@ The prompt must be COMPLETELY SELF-CONTAINED with ALL necessary information incl
 - Any credentials or configuration details
 
 The future agent will NOT remember anything from the current conversation.
+If you are testing or rerunning an existing cronjob, prefer `from_job_id`
+plus a new schedule so you reuse the exact stored prompt instead of retyping it.
 
 SCHEDULE FORMATS:
 - One-shot: "30m", "2h", "1d" (runs once after delay)
@@ -200,11 +240,15 @@ Use for: reminders, periodic checks, scheduled reports, automated maintenance.""
         "properties": {
             "prompt": {
                 "type": "string",
-                "description": "Complete, self-contained instructions. Must include ALL context - the future agent will have NO memory of this conversation."
+                "description": "Complete, self-contained instructions. Must include ALL context - the future agent will have NO memory of this conversation. Optional when from_job_id is provided."
             },
             "schedule": {
                 "type": "string",
                 "description": "When to run: '30m' (once in 30min), 'every 30m' (recurring), '0 9 * * *' (cron), or ISO timestamp"
+            },
+            "from_job_id": {
+                "type": "string",
+                "description": "Optional existing cron job ID to clone prompt/name/delivery defaults from. Use this when testing or rerunning an existing job to avoid stale prompt copies."
             },
             "name": {
                 "type": "string",
@@ -219,7 +263,7 @@ Use for: reminders, periodic checks, scheduled reports, automated maintenance.""
                 "description": "Where to send output: 'origin' (back to this chat), 'local' (files only), 'telegram', 'discord', or 'platform:chat_id'"
             }
         },
-        "required": ["prompt", "schedule"]
+        "required": ["schedule"]
     }
 }
 
@@ -436,6 +480,7 @@ registry.register(
         name=args.get("name"),
         repeat=args.get("repeat"),
         deliver=args.get("deliver"),
+        from_job_id=args.get("from_job_id"),
         task_id=kw.get("task_id")),
     check_fn=check_cronjob_requirements,
 )

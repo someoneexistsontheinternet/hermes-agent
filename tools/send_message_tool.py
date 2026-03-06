@@ -180,13 +180,14 @@ async def _send_discord(token, chat_id, message):
     """Send via Discord REST API (no websocket client needed)."""
     try:
         import aiohttp
-        from gateway.platforms.base import split_message_chunks
+        from gateway.platforms.base import split_message_chunks, format_discord_chunk_suffix
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
         url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
         headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-        chunks = split_message_chunks(message, 2000)
+        chunks = split_message_chunks(message, 1996)
+        chunks = [format_discord_chunk_suffix(chunk) for chunk in chunks]
         message_ids = []
         async with aiohttp.ClientSession() as session:
             for chunk in chunks:

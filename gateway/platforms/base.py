@@ -183,6 +183,16 @@ def split_message_chunks(content: str, max_length: int = 4096) -> List[str]:
     return chunks
 
 
+def format_discord_chunk_suffix(chunk: str) -> str:
+    """
+    Rewrite a trailing inline chunk counter to Discord subtext style.
+
+    Example:
+        "hello (1/2)" -> "hello\\n-# (1/2)"
+    """
+    return re.sub(r" \((\d+)/(\d+)\)$", r"\n-# (\1/\2)", chunk)
+
+
 # ---------------------------------------------------------------------------
 # Audio cache utilities
 #

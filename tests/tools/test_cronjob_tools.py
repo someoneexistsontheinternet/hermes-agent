@@ -4,6 +4,7 @@ import json
 import pytest
 from pathlib import Path
 
+from cron.jobs import get_job
 from tools.cronjob_tools import (
     _scan_cron_prompt,
     schedule_cronjob,
@@ -116,6 +117,68 @@ class TestScheduleCronjob:
             repeat=5,
         ))
         assert result["repeat"] == "5 times"
+
+    def test_schedule_from_existing_job(self):
+        created = json.loads(schedule_cronjob(
+            prompt="Use the stored prompt",
+            schedule="every 1h",
+            name="Base Job",
+            deliver="discord:123",
+        ))
+
+        cloned = json.loads(schedule_cronjob(
+            schedule="30m",
+            from_job_id=created["job_id"],
+        ))
+
+        assert cloned["success"] is True
+        assert cloned["cloned_from_job_id"] == created["job_id"]
+
+        cloned_job = get_job(cloned["job_id"])
+        assert cloned_job["prompt"] == "Use the stored prompt"
+        assert cloned_job["name"] == "Base Job"
+        assert cloned_job["deliver"] == "discord:123"
+
+    def test_schedule_from_existing_job_preserves_origin_delivery(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "123")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "channel")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "Source Chat")
+        monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-1")
+        created = json.loads(schedule_cronjob(
+            prompt="Use source origin",
+            schedule="every 1h",
+            name="Origin Job",
+        ))
+
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "999")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "Current Chat")
+        cloned = json.loads(schedule_cronjob(
+            schedule="30m",
+            from_job_id=created["job_id"],
+        ))
+
+        cloned_job = get_job(cloned["job_id"])
+        assert cloned_job["deliver"] == "origin"
+        assert cloned_job["origin"]["chat_id"] == "123"
+        assert cloned_job["origin"]["chat_type"] == "channel"
+        assert cloned_job["origin"]["chat_name"] == "Source Chat"
+        assert cloned_job["origin"]["thread_id"] == "thread-1"
+
+    def test_schedule_from_missing_job(self):
+        result = json.loads(schedule_cronjob(
+            schedule="30m",
+            from_job_id="missing-job",
+        ))
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_schedule_requires_prompt_or_source_job(self):
+        result = json.loads(schedule_cronjob(
+            schedule="30m",
+        ))
+        assert result["success"] is False
+        assert "required" in result["error"].lower()
 
 
 # =========================================================================

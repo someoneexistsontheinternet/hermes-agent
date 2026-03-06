@@ -82,10 +82,13 @@ def check_fork_thread_requirements() -> bool:
     platform = (os.getenv("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
     chat_type = (os.getenv("HERMES_SESSION_CHAT_TYPE", "") or "").strip().lower()
     chat_id = (os.getenv("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    live_available_env = (os.getenv("HERMES_DISCORD_FORK_THREAD_AVAILABLE", "") or "").strip()
 
     if platform != "discord":
         return False
     if chat_type not in {"group", "channel"}:
+        return False
+    if live_available_env and not _parse_bool(live_available_env, default=False):
         return False
 
     settings = _current_discord_auto_fork_settings()
@@ -104,6 +107,7 @@ def fork_thread_tool(
     platform = (os.getenv("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
     chat_type = (os.getenv("HERMES_SESSION_CHAT_TYPE", "") or "").strip().lower()
     chat_id = (os.getenv("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    live_available_env = (os.getenv("HERMES_DISCORD_FORK_THREAD_AVAILABLE", "") or "").strip()
     if platform != "discord":
         return json.dumps(
             {"success": False, "error": "fork_thread is only available in Discord gateway sessions."},
@@ -112,6 +116,11 @@ def fork_thread_tool(
     if chat_type not in {"group", "channel"}:
         return json.dumps(
             {"success": False, "error": "fork_thread can only be used from Discord server channels."},
+            ensure_ascii=False,
+        )
+    if live_available_env and not _parse_bool(live_available_env, default=False):
+        return json.dumps(
+            {"success": False, "error": "Discord live thread forking is not available in this session."},
             ensure_ascii=False,
         )
 

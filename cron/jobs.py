@@ -1,8 +1,8 @@
 """
 Cron job storage and management.
 
-Jobs are stored in ~/.hermes/cron/jobs.json
-Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
+Jobs are stored in {HERMES_HOME}/cron/jobs.json
+Output is saved to {HERMES_HOME}/cron/output/{job_id}/{timestamp}.md
 """
 
 import json
@@ -24,7 +24,12 @@ except ImportError:
 # Configuration
 # =============================================================================
 
-HERMES_DIR = Path.home() / ".hermes"
+def _get_hermes_dir() -> Path:
+    """Resolve Hermes home, honoring HERMES_HOME when set before import."""
+    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")).expanduser()
+
+
+HERMES_DIR = _get_hermes_dir()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
 OUTPUT_DIR = CRON_DIR / "output"

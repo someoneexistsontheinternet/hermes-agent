@@ -42,6 +42,7 @@ from gateway.platforms.base import (
     SendResult,
     cache_image_from_url,
     cache_audio_from_url,
+    format_discord_chunk_suffix,
 )
 
 
@@ -76,6 +77,7 @@ class DiscordAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
+        self._start_task: Optional[asyncio.Task] = None
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._archive_db: Optional[DiscordArchiveDB] = None
         self._bootstrapped_channels: Set[str] = set()
@@ -136,6 +138,7 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_ready():
                 print(f"[{adapter_self.name}] Connected as {adapter_self._client.user}")
+                adapter_self._running = True
                 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
@@ -230,7 +233,8 @@ class DiscordAdapter(BasePlatformAdapter):
             self._register_slash_commands()
             
             # Start the bot in background
-            asyncio.create_task(self._client.start(self.config.token))
+            self._start_task = asyncio.create_task(self._client.start(self.config.token))
+            self._start_task.add_done_callback(self._handle_start_task_done)
             
             # Wait for ready
             await asyncio.wait_for(self._ready_event.wait(), timeout=30)
@@ -239,11 +243,63 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
             
         except asyncio.TimeoutError:
+            if self._start_task and not self._start_task.done():
+                logger.warning(
+                    "%s readiness timed out after 30s; startup will continue in the background",
+                    self.name,
+                )
+                return True
             print(f"[{self.name}] Timeout waiting for connection")
             return False
         except Exception as e:
+            await self._cancel_start_task()
             print(f"[{self.name}] Failed to connect: {e}")
             return False
+
+    @property
+    def is_connected(self) -> bool:
+        """Report live Discord readiness instead of task creation state."""
+        client = self._client
+        if not client or not self._ready_event.is_set():
+            return False
+        is_closed = getattr(client, "is_closed", None)
+        if callable(is_closed):
+            try:
+                return not bool(is_closed())
+            except Exception:
+                return False
+        return True
+
+    def _handle_start_task_done(self, task: asyncio.Task) -> None:
+        """Record background start-task failures and connection shutdown."""
+        if task is not self._start_task:
+            return
+        self._start_task = None
+        self._running = False
+        self._ready_event.clear()
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except Exception as err:
+            logger.debug("Discord start task completion inspection failed: %s", err)
+            return
+        if exc is not None:
+            logger.warning("Discord client task exited with error: %s", exc)
+
+    async def _cancel_start_task(self) -> None:
+        """Cancel any in-flight Discord client task."""
+        task = self._start_task
+        if not task:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug("Discord start task cleanup failed: %s", e)
     
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
@@ -253,6 +309,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._client.close()
             except Exception as e:
                 print(f"[{self.name}] Error during disconnect: {e}")
+        await self._cancel_start_task()
         
         self._running = False
         self._client = None
@@ -300,7 +357,11 @@ class DiscordAdapter(BasePlatformAdapter):
             
             # Format and split message if needed
             formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            # Discord subtext chunk markers are 4 chars longer than the shared
+            # inline suffix format (" (1/2)" -> "\n-# (1/2)"), so reserve room
+            # before rewriting the suffix.
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH - 4)
+            chunks = [format_discord_chunk_suffix(chunk) for chunk in chunks]
             
             message_ids = []
             reference = None

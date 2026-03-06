@@ -206,6 +206,41 @@ class GatewayRunner:
         if _has_context_files(hermes_home):
             return str(hermes_home)
         return str(cwd)
+
+    def _connected_platforms(self) -> List[Platform]:
+        """Return platforms whose adapters currently report a live connection."""
+        connected: List[Platform] = []
+        for platform, adapter in self.adapters.items():
+            try:
+                if bool(getattr(adapter, "is_connected", True)):
+                    connected.append(platform)
+            except Exception:
+                continue
+        return connected
+
+    def _live_discord_adapter(self) -> Optional[BasePlatformAdapter]:
+        """Return the Discord adapter when it is live and connected."""
+        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None:
+            return None
+        try:
+            if not bool(getattr(adapter, "is_connected", True)):
+                return None
+        except Exception:
+            return None
+        return adapter
+
+    def _discord_fork_available(self, source: SessionSource) -> bool:
+        """Return True when this source can use live Discord thread forking."""
+        if source.platform != Platform.DISCORD or source.chat_type not in {"group", "channel"}:
+            return False
+
+        adapter = self._live_discord_adapter()
+        if adapter is None:
+            return False
+
+        checker = getattr(adapter, "is_auto_fork_available", None)
+        return callable(checker) and checker(source)
     
     def _flush_memories_before_reset(self, old_entry):
         """Prompt the agent to save memories/skills before an auto-reset.
@@ -845,7 +880,12 @@ class GatewayRunner:
         session_key = session_entry.session_key
         
         # Build session context
-        context = build_session_context(source, self.config, session_entry)
+        context = build_session_context(
+            source,
+            self.config,
+            session_entry,
+            connected_platforms=self._connected_platforms(),
+        )
         
         # Set environment variables for tools
         self._set_session_env(context)
@@ -874,8 +914,18 @@ class GatewayRunner:
             context_prompt = note + "\n\n" + context_prompt
             session_entry.was_auto_reset = False
         
-        # Load conversation history from transcript
-        history = self.session_store.load_transcript(session_entry.session_id)
+        # Load conversation history from transcript.
+        #
+        # After a Discord main-channel fork, the persisted parent session ends
+        # with a fork handoff sequence:
+        #   user -> assistant(fork_thread) -> tool(success) -> assistant("[Continued in thread ...]")
+        # Keep that full trail in the transcript for auditability, but collapse
+        # it into one compact routing note for future parent-channel model
+        # history so later pings know the topic already has a thread.
+        history = self._collapse_trailing_fork_handoffs(
+            self.session_store.load_transcript(session_entry.session_id),
+            source=source,
+        )
         
         # First-message onboarding -- only on the very first interaction ever
         if not history and not self.session_store.has_any_sessions():
@@ -1269,7 +1319,7 @@ class GatewayRunner:
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         
-        connected_platforms = [p.value for p in self.adapters.keys()]
+        connected_platforms = [p.value for p in self._connected_platforms()]
         
         # Check if there's an active agent
         session_key = session_entry.session_key
@@ -1295,7 +1345,7 @@ class GatewayRunner:
         if source.platform != Platform.DISCORD:
             return "Fork is only available on Discord."
 
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = self._live_discord_adapter()
         if adapter is None:
             return "Fork failed: Discord adapter is not available."
 
@@ -1311,12 +1361,7 @@ class GatewayRunner:
 
     def _discord_auto_fork_prompt_note(self, source: SessionSource) -> str:
         """Return Discord auto-fork guidance when the tool is available."""
-        if source.platform != Platform.DISCORD or source.chat_type not in {"group", "channel"}:
-            return ""
-
-        adapter = self.adapters.get(Platform.DISCORD)
-        checker = getattr(adapter, "is_auto_fork_available", None)
-        if not callable(checker) or not checker(source):
+        if not self._discord_fork_available(source):
             return ""
 
         return (
@@ -1367,6 +1412,133 @@ class GatewayRunner:
             }
 
         return request
+
+    @staticmethod
+    def _build_parent_fork_session_note(
+        *,
+        thread_mention: str,
+        title: str = "",
+        original_request: str = "",
+    ) -> str:
+        """Build a compact parent-session note for an already-forked topic."""
+        thread_text = str(thread_mention or "").strip() or "the existing thread"
+        title_text = " ".join(str(title or "").split()).strip()
+        request_text = " ".join(str(original_request or "").split()).strip()
+        if len(request_text) > 180:
+            request_text = request_text[:177].rstrip() + "..."
+
+        parts = [
+            f"[Routing note: This side discussion was already forked to {thread_text}.",
+        ]
+        if title_text:
+            parts.append(f"Thread topic: {title_text}.")
+        if request_text:
+            parts.append(f'Original request: "{request_text}".')
+        parts.append(
+            "If the user continues the same topic in the parent channel, do not answer it here; tell them to continue in the existing thread.]"
+        )
+        return " ".join(parts)
+
+    @classmethod
+    def _collapse_trailing_fork_handoffs(
+        cls,
+        history: List[Dict[str, Any]],
+        *,
+        source: Optional[SessionSource] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Collapse trailing Discord fork handoff turns into one routing note.
+
+        The persisted parent-channel transcript intentionally records the fork
+        request and handoff note, but replaying the raw tool traffic into the
+        next main-channel turn is noisy. Preserve only the useful state: that a
+        thread already exists and repeated parent-channel follow-ups should be
+        redirected there. Only collapse this pattern for Discord server channels.
+        """
+        if not history:
+            return history
+
+        if (
+            source is None
+            or source.platform != Platform.DISCORD
+            or source.chat_type not in {"group", "channel"}
+        ):
+            return history
+
+        collapsed = list(history)
+
+        while len(collapsed) >= 4:
+            notice_msg = collapsed[-1]
+            tool_msg = collapsed[-2]
+            assistant_msg = collapsed[-3]
+
+            notice_text = notice_msg.get("content")
+            if (
+                notice_msg.get("role") != "assistant"
+                or not isinstance(notice_text, str)
+                or not notice_text.startswith("[Continued in thread <#")
+                or not notice_text.endswith(">]")
+            ):
+                break
+
+            if tool_msg.get("role") != "tool":
+                break
+
+            try:
+                payload = json.loads(tool_msg.get("content") or "{}")
+            except Exception:
+                break
+
+            if not payload.get("success") or not payload.get("requested"):
+                break
+
+            thread_id = str(payload.get("thread_id") or "").strip()
+            if not thread_id:
+                break
+
+            if assistant_msg.get("role") != "assistant":
+                break
+
+            fork_call_ids = {
+                str(call.get("id") or "").strip()
+                for call in (assistant_msg.get("tool_calls") or [])
+                if str((call.get("function") or {}).get("name") or "").strip() == "fork_thread"
+            }
+            if not fork_call_ids:
+                break
+
+            tool_call_id = str(tool_msg.get("tool_call_id") or "").strip()
+            if tool_call_id and tool_call_id not in fork_call_ids:
+                break
+
+            start_index = len(collapsed) - 3
+            prior_user_msg: Optional[Dict[str, Any]] = None
+            if collapsed[start_index - 1].get("role") == "user":
+                prior_user_msg = collapsed[start_index - 1]
+                start_index -= 1
+
+            thread_mention = str(payload.get("thread_mention") or f"<#{thread_id}>")
+            parent_note = str(payload.get("parent_session_note") or "").strip()
+            if not parent_note:
+                original_request = ""
+                if prior_user_msg is not None and isinstance(prior_user_msg.get("content"), str):
+                    original_request = str(prior_user_msg.get("content") or "")
+                parent_note = cls._build_parent_fork_session_note(
+                    thread_mention=thread_mention,
+                    title=str(payload.get("title") or ""),
+                    original_request=original_request,
+                )
+
+            collapsed = collapsed[:start_index] + [
+                {
+                    "role": "assistant",
+                    "content": parent_note,
+                    "forked_to_thread": thread_mention,
+                }
+            ]
+            break
+
+        return collapsed
 
     @staticmethod
     def _rewrite_transcript_for_fork_notice(
@@ -1468,12 +1640,18 @@ class GatewayRunner:
         """Create the fork thread immediately and switch live delivery to it."""
         if delivery_state.get("thread_result"):
             result = dict(delivery_state["thread_result"])
+            thread_mention = str(result.get("thread_mention") or f"<#{result.get('thread_id', '')}>")
             result.update(
                 {
                     "success": True,
                     "requested": True,
                     "already_forked": True,
                     "reason": reason,
+                    "parent_session_note": self._build_parent_fork_session_note(
+                        thread_mention=thread_mention,
+                        title=str(result.get("thread_name") or title or ""),
+                        original_request=str(getattr(event, "text", "") or ""),
+                    ),
                 }
             )
             return result
@@ -1481,7 +1659,7 @@ class GatewayRunner:
         if source.platform != Platform.DISCORD or source.chat_type not in {"group", "channel"}:
             return {"success": False, "error": "fork_thread is only available in Discord server channels."}
 
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = self._live_discord_adapter()
         if not adapter:
             return {"success": False, "error": "Discord adapter is not available."}
 
@@ -1560,6 +1738,11 @@ class GatewayRunner:
                 "reason": reason,
                 "redirect_final_response": True,
                 "main_channel_notice": main_notice is not None,
+                "parent_session_note": self._build_parent_fork_session_note(
+                    thread_mention=thread_mention,
+                    title=str(thread_result.get("thread_name") or title or ""),
+                    original_request=str(getattr(event, "text", "") or ""),
+                ),
             }
         )
         return payload
@@ -1579,7 +1762,7 @@ class GatewayRunner:
         if source.platform != Platform.DISCORD or source.chat_type not in {"group", "channel"}:
             return None
 
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = self._live_discord_adapter()
         if not adapter:
             return None
 
@@ -1874,6 +2057,9 @@ class GatewayRunner:
         os.environ["HERMES_SESSION_PLATFORM"] = context.source.platform.value
         os.environ["HERMES_SESSION_CHAT_ID"] = context.source.chat_id
         os.environ["HERMES_SESSION_CHAT_TYPE"] = context.source.chat_type
+        os.environ["HERMES_DISCORD_FORK_THREAD_AVAILABLE"] = (
+            "1" if self._discord_fork_available(context.source) else "0"
+        )
         if context.source.chat_name:
             os.environ["HERMES_SESSION_CHAT_NAME"] = context.source.chat_name
         if context.source.thread_id:
@@ -1885,6 +2071,7 @@ class GatewayRunner:
             "HERMES_SESSION_PLATFORM",
             "HERMES_SESSION_CHAT_ID",
             "HERMES_SESSION_CHAT_TYPE",
+            "HERMES_DISCORD_FORK_THREAD_AVAILABLE",
             "HERMES_SESSION_CHAT_NAME",
             "HERMES_SESSION_THREAD_ID",
         ]:

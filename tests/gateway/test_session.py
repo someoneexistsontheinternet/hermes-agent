@@ -177,6 +177,65 @@ class TestBuildSessionContextPrompt:
 
         assert "Discord" in prompt
 
+    def test_discord_prompt_uses_live_connected_platform_override(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    token="fake-discord-token",
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_name="Server",
+            chat_type="group",
+        )
+
+        ctx = build_session_context(source, config, connected_platforms=[])
+        prompt = build_session_context_prompt(ctx)
+
+        assert "discord: Connected" not in prompt
+        assert "**Connected Platforms:** local (files on this machine)" in prompt
+
+    def test_discord_prompt_is_stable_across_users(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    token="fake-discord-token",
+                ),
+            },
+        )
+        gifted_ctx = build_session_context(
+            SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="guild-123",
+                chat_name="Server",
+                chat_type="group",
+                user_name="giftedgummybee",
+            ),
+            config,
+        )
+        duke_ctx = build_session_context(
+            SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="guild-123",
+                chat_name="Server",
+                chat_type="group",
+                user_name="dukeofkelvinsi",
+            ),
+            config,
+        )
+
+        gifted_prompt = build_session_context_prompt(gifted_ctx)
+        duke_prompt = build_session_context_prompt(duke_ctx)
+
+        assert gifted_prompt == duke_prompt
+        assert "**User:**" not in gifted_prompt
+        assert "**User ID:**" not in gifted_prompt
+
     def test_local_prompt_mentions_machine(self):
         config = GatewayConfig()
         source = SessionSource.local_cli()

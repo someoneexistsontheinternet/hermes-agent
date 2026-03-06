@@ -1320,3 +1320,69 @@ class TestDiscordAdapterContextSettings:
 
         assert "event" in captured
         assert "Forwarded event payload" in captured["event"].text
+
+
+class _FakeDiscordTree:
+    async def sync(self):
+        return []
+
+
+class _FakeDiscordBot:
+    def __init__(self, *args, **kwargs):
+        self.tree = _FakeDiscordTree()
+        self.user = "fake-bot"
+        self._closed = False
+        self._stop_event = asyncio.Event()
+
+    def event(self, func):
+        setattr(self, func.__name__, func)
+        return func
+
+    async def start(self, _token):
+        await self._stop_event.wait()
+
+    async def close(self):
+        self._closed = True
+        self._stop_event.set()
+
+    def is_closed(self):
+        return self._closed
+
+
+class _FakeIntents:
+    @staticmethod
+    def default():
+        return SimpleNamespace()
+
+
+class TestDiscordAdapterConnectTimeout:
+    def test_timeout_keeps_background_startup_task_registered(self, monkeypatch):
+        adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
+
+        async def _timeout(_awaitable, timeout=None):
+            close = getattr(_awaitable, "close", None)
+            if callable(close):
+                close()
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr("gateway.platforms.discord.DISCORD_AVAILABLE", True)
+        monkeypatch.setattr("gateway.platforms.discord.Intents", _FakeIntents)
+        monkeypatch.setattr(
+            "gateway.platforms.discord.commands",
+            SimpleNamespace(Bot=_FakeDiscordBot),
+        )
+        monkeypatch.setattr("gateway.platforms.discord.asyncio.wait_for", _timeout)
+        monkeypatch.setattr(adapter, "_register_slash_commands", lambda: None)
+
+        async def _exercise():
+            connected = await adapter.connect()
+            assert connected is True
+            assert adapter._start_task is not None
+            assert adapter._start_task.done() is False
+            assert adapter.is_connected is False
+
+            await adapter.disconnect()
+            assert adapter._start_task is None
+            assert adapter._client is None
+
+        asyncio.run(_exercise())

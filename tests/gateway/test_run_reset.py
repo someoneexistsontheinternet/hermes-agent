@@ -3,13 +3,14 @@
 import asyncio
 import base64
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_context
 
 
 def test_gateway_prefers_hermes_home_for_context_files(monkeypatch, tmp_path):
@@ -103,6 +104,38 @@ def test_discord_plain_text_turn_uses_context_without_duplicate_tail(tmp_path):
 
     assert response == "ok"
     assert captured["message"] == extra_context
+
+
+def test_set_session_env_tracks_live_discord_fork_availability(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+    context = build_session_context(source, runner.config, connected_platforms=[])
+
+    runner.adapters[Platform.DISCORD] = SimpleNamespace(
+        is_connected=True,
+        is_auto_fork_available=lambda _source: True,
+    )
+    runner._set_session_env(context)
+    assert os.environ["HERMES_DISCORD_FORK_THREAD_AVAILABLE"] == "1"
+
+    runner.adapters[Platform.DISCORD] = SimpleNamespace(
+        is_connected=False,
+        is_auto_fork_available=lambda _source: True,
+    )
+    runner._set_session_env(context)
+    assert os.environ["HERMES_DISCORD_FORK_THREAD_AVAILABLE"] == "0"
+
+    runner._clear_session_env()
+    assert "HERMES_DISCORD_FORK_THREAD_AVAILABLE" not in os.environ
 
 
 def test_handle_message_appends_discord_cost_summary_and_updates_tokens(tmp_path):
@@ -497,6 +530,92 @@ def test_extract_fork_thread_request_uses_latest_successful_tool_result(tmp_path
     assert request == {"title": "deep-dive", "visibility": "private", "reason": ""}
 
 
+def test_handle_message_collapses_trailing_main_channel_fork_handoff_history(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+
+    session_entry = runner.session_store.get_or_create_session(source)
+    runner.session_store.append_to_transcript(
+        session_entry.session_id,
+        {"role": "user", "content": "@Hermes-Bot How do I do mergesort with a stack?"},
+    )
+    runner.session_store.append_to_transcript(
+        session_entry.session_id,
+        {
+            "role": "assistant",
+            "content": "<REASONING_SCRATCHPAD>fork it</REASONING_SCRATCHPAD>",
+            "tool_calls": [
+                {
+                    "id": "call_fork",
+                    "type": "function",
+                    "function": {"name": "fork_thread", "arguments": "{}"},
+                }
+            ],
+        },
+    )
+    runner.session_store.append_to_transcript(
+        session_entry.session_id,
+        {
+            "role": "tool",
+            "tool_call_id": "call_fork",
+            "content": json.dumps(
+                {
+                    "success": True,
+                    "requested": True,
+                    "thread_id": "th456",
+                    "thread_mention": "<#th456>",
+                }
+            ),
+        },
+    )
+    runner.session_store.append_to_transcript(
+        session_entry.session_id,
+        {"role": "assistant", "content": "[Continued in thread <#th456>]"},
+    )
+
+    captured = {}
+
+    async def _fake_run_agent(*, history, message, **kwargs):
+        captured["history"] = history
+        captured["message"] = message
+        return {
+            "final_response": "ok",
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "ok"},
+            ],
+            "history_input_len": 0,
+            "tools": [],
+        }
+
+    runner._run_agent = _fake_run_agent
+
+    event = MessageEvent(
+        text="@Hermes-Bot follow-up in the main channel",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    response = asyncio.run(runner._handle_message(event))
+
+    assert response == "ok"
+    assert len(captured["history"]) == 1
+    assert captured["history"][0]["role"] == "assistant"
+    assert "<#th456>" in captured["history"][0]["content"]
+    assert "continue" in captured["history"][0]["content"].lower()
+    assert "mergesort" in captured["history"][0]["content"].lower()
+
+
 def test_handle_message_routes_auto_fork_response_to_thread(tmp_path):
     runner = GatewayRunner(
         GatewayConfig(sessions_dir=tmp_path / "sessions")
@@ -701,3 +820,4 @@ def test_activate_live_fork_thread_switches_delivery_target_immediately(tmp_path
     assert getattr(event, "_active_session_aliases") == ["th789"]
     assert runner.adapters[Platform.DISCORD]._active_sessions["th789"] is active_event
     assert sent == [("ch123", "Taking this to a thread: <#th789>", "m123")]
+    assert "<#th789>" in result["parent_session_note"]

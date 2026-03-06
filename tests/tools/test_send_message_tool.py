@@ -53,5 +53,5 @@ def test_send_discord_uses_newline_aware_chunking(monkeypatch):
     assert result["success"] is True
     assert result["message_ids"] == ["1", "2"]
     assert all(len(chunk) <= 2000 for chunk in sent)
-    assert sent[0].rsplit(" (1/2)", 1)[0] == f"{line}\n{line}"
-    assert sent[1].rsplit(" (2/2)", 1)[0] == line
+    assert sent[0].rsplit("\n-# (1/2)", 1)[0] == f"{line}\n{line}"
+    assert sent[1].rsplit("\n-# (2/2)", 1)[0] == line

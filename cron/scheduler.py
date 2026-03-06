@@ -26,7 +26,7 @@ except ImportError:
         msvcrt = None
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,14 @@ _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
 _CONTEXT_FILES = ("AGENTS.md", "SOUL.md", ".cursorrules")
+_SESSION_ENV_MAP = {
+    "platform": "HERMES_SESSION_PLATFORM",
+    "chat_id": "HERMES_SESSION_CHAT_ID",
+    "chat_type": "HERMES_SESSION_CHAT_TYPE",
+    "chat_name": "HERMES_SESSION_CHAT_NAME",
+    "thread_id": "HERMES_SESSION_THREAD_ID",
+}
+_SESSION_ENV_KEYS = tuple(_SESSION_ENV_MAP.values())
 
 
 def _has_context_files(path: Path) -> bool:
@@ -57,6 +65,149 @@ def _resolve_context_cwd() -> str:
     if _has_context_files(hermes_home):
         return str(hermes_home)
     return str(cwd)
+
+
+def _load_workspace_config() -> Dict[str, Any]:
+    """Load the active HERMES_HOME config file."""
+    config_path = _hermes_home / "config.yaml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        import yaml
+
+        with config_path.open(encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except UnicodeDecodeError:
+        try:
+            import yaml
+
+            with config_path.open(encoding="latin-1") as f:
+                config = yaml.safe_load(f) or {}
+        except Exception:
+            return {}
+    except Exception:
+        return {}
+
+    return config if isinstance(config, dict) else {}
+
+
+def _load_prefill_messages() -> List[Dict[str, Any]]:
+    """Load ephemeral prefill messages from env/config, mirroring gateway behavior."""
+    file_path = str(os.getenv("HERMES_PREFILL_MESSAGES_FILE", "") or "").strip()
+    if not file_path:
+        file_path = str(_load_workspace_config().get("prefill_messages_file", "") or "").strip()
+    if not file_path:
+        return []
+
+    path = Path(file_path).expanduser()
+    if not path.is_absolute():
+        path = _hermes_home / path
+    if not path.exists():
+        logger.warning("Prefill messages file not found: %s", path)
+        return []
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning("Failed to load prefill messages from %s: %s", path, e)
+        return []
+
+    if not isinstance(data, list):
+        logger.warning("Prefill messages file must contain a JSON array: %s", path)
+        return []
+    return data
+
+
+def _load_ephemeral_system_prompt() -> str:
+    """Load the workspace/system prompt override for cron runs."""
+    prompt = str(os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "") or "").strip()
+    if prompt:
+        return prompt
+    agent_cfg = _load_workspace_config().get("agent", {})
+    if not isinstance(agent_cfg, dict):
+        return ""
+    return str(agent_cfg.get("system_prompt", "") or "").strip()
+
+
+def _load_reasoning_config() -> Optional[Dict[str, Any]]:
+    """Load reasoning config from env/config, mirroring gateway behavior."""
+    effort = str(os.getenv("HERMES_REASONING_EFFORT", "") or "").strip()
+    if not effort:
+        agent_cfg = _load_workspace_config().get("agent", {})
+        if isinstance(agent_cfg, dict):
+            effort = str(agent_cfg.get("reasoning_effort", "") or "").strip()
+    if not effort:
+        return None
+
+    effort = effort.lower().strip()
+    if effort == "none":
+        return {"enabled": False}
+
+    valid = ("xhigh", "high", "medium", "low", "minimal")
+    if effort in valid:
+        return {"enabled": True, "effort": effort}
+
+    logger.warning("Unknown reasoning_effort '%s', using default (xhigh)", effort)
+    return None
+
+
+def _resolve_runtime_platform(job: dict) -> str:
+    """Pick the platform profile cron should emulate for this job."""
+    origin = _resolve_origin(job)
+    platform = str((origin or {}).get("platform", "") or "").strip().lower()
+    if not platform:
+        deliver = str(job.get("deliver", "") or "").strip().lower()
+        if deliver and deliver != "origin":
+            platform = deliver.split(":", 1)[0].strip()
+
+    if platform in ("", "origin", "local"):
+        return "cli"
+    return platform
+
+
+def _load_enabled_toolsets(platform_key: str) -> Optional[List[str]]:
+    """Resolve per-platform toolsets from config, with gateway-compatible defaults."""
+    normalized = (platform_key or "cli").strip().lower()
+    config_toolsets = _load_workspace_config().get("platform_toolsets", {})
+    if isinstance(config_toolsets, dict):
+        configured = config_toolsets.get(normalized)
+        if isinstance(configured, list):
+            resolved = [str(item).strip() for item in configured if str(item).strip()]
+            if resolved:
+                return resolved
+
+    default_toolset_map = {
+        "cli": "hermes-cli",
+        "telegram": "hermes-telegram",
+        "discord": "hermes-discord",
+        "whatsapp": "hermes-whatsapp",
+        "slack": "hermes-slack",
+    }
+    default_toolset = default_toolset_map.get(normalized)
+    return [default_toolset] if default_toolset else None
+
+
+def _clear_job_session_env() -> None:
+    """Clear origin/session environment variables between cron runs."""
+    for key in _SESSION_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def _set_job_session_env(origin: Optional[dict]) -> None:
+    """Set origin/session environment variables for tool availability checks."""
+    _clear_job_session_env()
+    if not origin:
+        return
+
+    for origin_key, env_key in _SESSION_ENV_MAP.items():
+        value = origin.get(origin_key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            os.environ[env_key] = text
 
 
 def _bridge_terminal_config_from_yaml() -> None:
@@ -178,7 +329,7 @@ def _render_job_output(
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
-    """Extract origin info from a job, returning {platform, chat_id, chat_name} or None."""
+    """Extract origin info from a job, returning the stored origin dict or None."""
     origin = job.get("origin")
     if not origin:
         return None
@@ -287,16 +438,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     job_name = job["name"]
     prompt = job["prompt"]
     origin = _resolve_origin(job)
-    
+    platform_key = _resolve_runtime_platform(job)
+
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
-    # Inject origin context so the agent's send_message tool knows the chat
-    if origin:
-        os.environ["HERMES_SESSION_PLATFORM"] = origin["platform"]
-        os.environ["HERMES_SESSION_CHAT_ID"] = str(origin["chat_id"])
-        if origin.get("chat_name"):
-            os.environ["HERMES_SESSION_CHAT_NAME"] = origin["chat_name"]
+    # Inject origin context so platform-gated tools resolve the same way they do
+    # in live gateway sessions.
+    _set_job_session_env(origin)
 
     try:
         # Re-read .env and config.yaml fresh every run so provider/key
@@ -312,6 +461,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         api_key = _select_api_key(base_url)
         model_extra_body = None
+        enabled_toolsets = _load_enabled_toolsets(platform_key)
+        prefill_messages = _load_prefill_messages()
+        ephemeral_system_prompt = _load_ephemeral_system_prompt()
+        reasoning_config = _load_reasoning_config()
 
         try:
             resolved = load_model_runtime_config(
@@ -340,8 +493,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             api_key=api_key,
             base_url=base_url,
             model_extra_body=model_extra_body,
+            enabled_toolsets=enabled_toolsets,
             quiet_mode=True,
+            ephemeral_system_prompt=ephemeral_system_prompt or None,
+            prefill_messages=prefill_messages or None,
+            reasoning_config=reasoning_config,
             session_id=f"cron_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            platform=platform_key,
             context_cwd=_resolve_context_cwd(),
         )
         
@@ -393,8 +551,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     finally:
         # Clean up injected env vars so they don't leak to other jobs
-        for key in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME"):
-            os.environ.pop(key, None)
+        _clear_job_session_env()
 
 
 def tick(verbose: bool = True) -> int:

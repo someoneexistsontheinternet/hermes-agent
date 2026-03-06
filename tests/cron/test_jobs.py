@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import importlib
 import json
 import pytest
 from datetime import datetime, timedelta
@@ -263,3 +264,18 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+
+class TestHermesHomeResolution:
+    def test_uses_hermes_home_env(self, tmp_path, monkeypatch):
+        import cron.jobs as jobs_module
+
+        with monkeypatch.context() as m:
+            m.setenv("HERMES_HOME", str(tmp_path))
+            reloaded = importlib.reload(jobs_module)
+            assert reloaded.HERMES_DIR == tmp_path
+            assert reloaded.CRON_DIR == tmp_path / "cron"
+            assert reloaded.JOBS_FILE == tmp_path / "cron" / "jobs.json"
+            assert reloaded.OUTPUT_DIR == tmp_path / "cron" / "output"
+
+        importlib.reload(jobs_module)

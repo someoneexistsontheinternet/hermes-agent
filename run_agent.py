@@ -237,8 +237,8 @@ class AIAgent:
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         
         # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
-        # Reduces input costs by ~75% on multi-turn conversations by caching the
-        # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
+        # Hermes uses an explicit final-message breakpoint so routed providers
+        # like Vertex/Bedrock still work while preserving incremental cache hits.
         is_openrouter = "openrouter" in self.base_url.lower()
         is_claude = "claude" in self.model.lower()
         self._use_prompt_caching = is_openrouter and is_claude
@@ -373,7 +373,7 @@ class AIAgent:
         
         # Show prompt caching status
         if self._use_prompt_caching and not self.quiet_mode:
-            print(f"💾 Prompt caching: ENABLED (Claude via OpenRouter, {self._cache_ttl} TTL)")
+            print(f"💾 Prompt caching: ENABLED (Claude via OpenRouter explicit cache, {self._cache_ttl} TTL)")
         
         # Session logging setup - auto-save conversation trajectories for debugging
         self.session_start = datetime.now()
@@ -395,32 +395,59 @@ class AIAgent:
         # Track conversation messages for session logging
         self._session_messages: List[Dict[str, Any]] = []
         
-        # Cached system prompt -- built once per session, only rebuilt on compression
+        # Cached system prompt -- built once per session, only rebuilt on compression.
+        # For resumed sessions, we hydrate this from SessionDB so the prompt stays
+        # byte-for-byte stable across fresh gateway agent instances.
         self._cached_system_prompt: Optional[str] = None
-        
+
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
         self._session_db_writes = bool(session_db_writes)
         if self._session_db:
+            session_meta = None
             try:
-                self._session_db.create_session(
-                    session_id=self.session_id,
-                    source=self.platform or "cli",
-                    model=self.model,
-                    model_config={
-                        "max_iterations": self.max_iterations,
-                        "reasoning_config": reasoning_config,
-                        "max_tokens": max_tokens,
-                    },
-                    user_id=None,
-                )
+                session_meta = self._session_db.get_session(self.session_id)
             except Exception as e:
-                logger.debug("Session DB create_session failed: %s", e)
-        
+                logger.debug("Session DB get_session failed before create: %s", e)
+
+            if session_meta is None:
+                try:
+                    self._session_db.create_session(
+                        session_id=self.session_id,
+                        source=self.platform or "cli",
+                        model=self.model,
+                        model_config={
+                            "max_iterations": self.max_iterations,
+                            "reasoning_config": reasoning_config,
+                            "max_tokens": max_tokens,
+                        },
+                        user_id=None,
+                    )
+                    session_meta = self._session_db.get_session(self.session_id)
+                except Exception as e:
+                    logger.debug("Session DB create_session failed: %s", e)
+                    try:
+                        self._session_db._conn.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        session_meta = self._session_db.get_session(self.session_id)
+                    except Exception as get_e:
+                        logger.debug("Session DB get_session failed after create error: %s", get_e)
+            else:
+                logger.debug("Session %s already exists; reusing stored metadata", self.session_id)
+
+            try:
+                frozen_prompt = (session_meta or {}).get("system_prompt") if session_meta else None
+                if frozen_prompt:
+                    self._cached_system_prompt = frozen_prompt
+            except Exception as e:
+                logger.debug("Session DB frozen prompt hydration failed: %s", e)
+
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
-        
+
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
         self._memory_enabled = False
@@ -932,6 +959,16 @@ class AIAgent:
     def _env_flag_enabled(name: str) -> bool:
         return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
+    def _get_request_dumps_dir(self) -> Path:
+        """Resolve the directory used for raw API request/response debug dumps."""
+        request_dumps_dir = (os.getenv("HERMES_REQUEST_DUMPS_DIR", "") or "").strip()
+        if request_dumps_dir:
+            dump_dir = Path(request_dumps_dir).expanduser()
+        else:
+            dump_dir = self.logs_dir / "dumps"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        return dump_dir
+
     def _should_dump_request_preflight(self) -> bool:
         return self._env_flag_enabled("HERMES_DUMP_REQUESTS")
 
@@ -1056,7 +1093,7 @@ class AIAgent:
                 dump_payload["error"] = error_info
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            dump_file = self.logs_dir / f"request_dump_{self.session_id}_{timestamp}.json"
+            dump_file = self._get_request_dumps_dir() / f"request_dump_{self.session_id}_{timestamp}.json"
             dump_file.write_text(
                 json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8",
@@ -2169,12 +2206,11 @@ class AIAgent:
                     api_messages.insert(sys_offset + idx, pfm.copy())
             
             # Apply Anthropic prompt caching for Claude models via OpenRouter.
-            # Auto-detected: if model name contains "claude" and base_url is OpenRouter,
-            # inject cache_control breakpoints (system + last 3 messages) to reduce
-            # input token costs by ~75% on multi-turn conversations.
+            # Use a single final-message breakpoint so routed providers support
+            # caching without rotating multiple cache segments across turns.
             if self._use_prompt_caching:
                 api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl)
-            
+
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)
             approx_tokens = total_chars // 4  # Rough estimate: 4 chars per token

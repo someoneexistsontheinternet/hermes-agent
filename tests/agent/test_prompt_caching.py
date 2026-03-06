@@ -1,27 +1,24 @@
-"""Tests for agent/prompt_caching.py — Anthropic cache control injection."""
-
-import copy
-import pytest
+"""Tests for agent/prompt_caching.py — Anthropic cache control helpers."""
 
 from agent.prompt_caching import (
     _apply_cache_marker,
     apply_anthropic_cache_control,
+    build_anthropic_cache_control,
 )
 
 
 MARKER = {"type": "ephemeral"}
 
 
-def _strip_cache_control(value):
-    if isinstance(value, dict):
-        return {
-            k: _strip_cache_control(v)
-            for k, v in value.items()
-            if k != "cache_control"
+class TestBuildAnthropicCacheControl:
+    def test_default_ttl(self):
+        assert build_anthropic_cache_control() == {"type": "ephemeral"}
+
+    def test_1h_ttl(self):
+        assert build_anthropic_cache_control("1h") == {
+            "type": "ephemeral",
+            "ttl": "1h",
         }
-    if isinstance(value, list):
-        return [_strip_cache_control(item) for item in value]
-    return value
 
 
 class TestApplyCacheMarker:
@@ -78,7 +75,6 @@ class TestApplyAnthropicCacheControl:
     def test_system_message_gets_marker(self):
         msgs = [
             {"role": "system", "content": "You are helpful"},
-            {"role": "user", "content": "Hi"},
         ]
         result = apply_anthropic_cache_control(msgs)
         # System message should have cache_control
@@ -86,7 +82,7 @@ class TestApplyAnthropicCacheControl:
         assert isinstance(sys_content, list)
         assert sys_content[0]["cache_control"]["type"] == "ephemeral"
 
-    def test_last_3_non_system_get_markers(self):
+    def test_last_non_system_gets_marker(self):
         msgs = [
             {"role": "system", "content": "System"},
             {"role": "user", "content": "msg1"},
@@ -95,20 +91,12 @@ class TestApplyAnthropicCacheControl:
             {"role": "assistant", "content": "msg4"},
         ]
         result = apply_anthropic_cache_control(msgs)
-        # System (index 0) + last 3 non-system (indices 2, 3, 4) = 4 breakpoints
-        # Index 1 (msg1) should be normalized but should NOT have a marker
-        content_1 = result[1]["content"]
-        assert isinstance(content_1, list)
-        assert "cache_control" not in content_1[0]
-
-    def test_no_system_message(self):
-        msgs = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi"},
-        ]
-        result = apply_anthropic_cache_control(msgs)
-        # Both should get markers (4 slots available, only 2 messages)
-        assert len(result) == 2
+        for msg in result[:-1]:
+            content = msg.get("content")
+            if isinstance(content, list) and content:
+                assert "cache_control" not in content[-1]
+            assert "cache_control" not in msg
+        assert result[-1]["content"][0]["cache_control"]["type"] == "ephemeral"
 
     def test_1h_ttl(self):
         msgs = [{"role": "system", "content": "System prompt"}]
@@ -117,7 +105,7 @@ class TestApplyAnthropicCacheControl:
         assert isinstance(sys_content, list)
         assert sys_content[0]["cache_control"]["ttl"] == "1h"
 
-    def test_max_4_breakpoints(self):
+    def test_single_breakpoint_only(self):
         msgs = [
             {"role": "system", "content": "System"},
         ] + [
@@ -135,22 +123,18 @@ class TestApplyAnthropicCacheControl:
                         count += 1
             elif "cache_control" in msg:
                 count += 1
-        assert count <= 4
+        assert count == 1
 
-    def test_prefix_shape_stays_stable_across_turns(self):
+    def test_final_tool_message_gets_marker(self):
         first_turn = [
             {"role": "system", "content": "System"},
             {"role": "user", "content": "msg1"},
             {"role": "assistant", "content": "msg2"},
-            {"role": "user", "content": "msg3"},
-        ]
-        second_turn = first_turn + [
             {"role": "assistant", "content": "msg4"},
             {"role": "tool", "content": "tool-result-1"},
             {"role": "tool", "content": "tool-result-2"},
         ]
 
-        first_result = apply_anthropic_cache_control(first_turn)
-        second_result = apply_anthropic_cache_control(second_turn)
-
-        assert _strip_cache_control(first_result) == _strip_cache_control(second_result[:4])
+        result = apply_anthropic_cache_control(first_turn)
+        assert result[-1]["cache_control"]["type"] == "ephemeral"
+        assert "cache_control" not in result[-2]

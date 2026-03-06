@@ -1,11 +1,8 @@
-"""Anthropic prompt caching (system_and_3 strategy).
+"""Helpers for Anthropic/OpenRouter prompt caching.
 
-Reduces input token costs by ~75% on multi-turn conversations by caching
-the conversation prefix. Uses 4 cache_control breakpoints (Anthropic max):
-  1. System prompt (stable across all turns)
-  2-4. Last 3 non-system messages (rolling window)
-
-Pure functions -- no class state, no AIAgent dependency.
+Hermes uses explicit Anthropic cache breakpoints on the final message in each
+request. This keeps the cached prefix incremental across tool-loop turns while
+remaining compatible with routed providers such as Google Vertex and Bedrock.
 """
 
 import copy
@@ -44,13 +41,23 @@ def _apply_cache_marker(msg: dict, cache_marker: dict) -> None:
             last["cache_control"] = cache_marker
 
 
+def build_anthropic_cache_control(cache_ttl: str = "5m") -> Dict[str, str]:
+    """Build a top-level Anthropic/OpenRouter cache_control payload."""
+    marker: Dict[str, str] = {"type": "ephemeral"}
+    if cache_ttl == "1h":
+        marker["ttl"] = "1h"
+    return marker
+
+
 def apply_anthropic_cache_control(
     api_messages: List[Dict[str, Any]],
     cache_ttl: str = "5m",
 ) -> List[Dict[str, Any]]:
-    """Apply system_and_3 caching strategy to messages for Anthropic models.
+    """Apply a single incremental Anthropic cache breakpoint.
 
-    Places up to 4 cache_control breakpoints: system prompt + last 3 non-system messages.
+    Marks only the final non-system message (or the sole system message) so the
+    provider can reuse the longest previously cached prefix while we avoid
+    rotating multiple breakpoint positions across turns.
 
     Returns:
         Deep copy of messages with cache_control breakpoints injected.
@@ -62,19 +69,14 @@ def apply_anthropic_cache_control(
     for msg in messages:
         _normalize_text_content(msg)
 
-    marker = {"type": "ephemeral"}
-    if cache_ttl == "1h":
-        marker["ttl"] = "1h"
+    marker = build_anthropic_cache_control(cache_ttl)
 
-    breakpoints_used = 0
+    target_idx = 0
+    for idx in range(len(messages) - 1, -1, -1):
+        if messages[idx].get("role") != "system":
+            target_idx = idx
+            break
 
-    if messages[0].get("role") == "system":
-        _apply_cache_marker(messages[0], marker)
-        breakpoints_used += 1
-
-    remaining = 4 - breakpoints_used
-    non_sys = [i for i in range(len(messages)) if messages[i].get("role") != "system"]
-    for idx in non_sys[-remaining:]:
-        _apply_cache_marker(messages[idx], marker)
+    _apply_cache_marker(messages[target_idx], marker)
 
     return messages

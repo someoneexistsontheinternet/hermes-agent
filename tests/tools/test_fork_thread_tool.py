@@ -46,6 +46,16 @@ def test_check_fork_thread_requirements_honors_channel_allowlist(monkeypatch):
     assert check_fork_thread_requirements() is False
 
 
+def test_check_fork_thread_requirements_honors_live_availability(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "ch123")
+    monkeypatch.setenv("HERMES_DISCORD_FORK_THREAD_AVAILABLE", "0")
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: _gateway_config(enabled=True))
+
+    assert check_fork_thread_requirements() is False
+
+
 def test_fork_thread_tool_invokes_callback(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
@@ -89,3 +99,19 @@ def test_fork_thread_tool_without_callback_errors(monkeypatch):
 
     assert result["success"] is False
     assert "execution context" in result["error"]
+
+
+def test_fork_thread_tool_errors_when_live_forking_is_unavailable(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "ch123")
+    monkeypatch.setenv("HERMES_DISCORD_FORK_THREAD_AVAILABLE", "0")
+    monkeypatch.setattr(
+        "gateway.config.load_gateway_config",
+        lambda: _gateway_config(enabled=True, allowed_channel_ids=["ch123"]),
+    )
+
+    result = json.loads(fork_thread_tool({"title": "deep-dive"}))
+
+    assert result["success"] is False
+    assert "not available in this session" in result["error"]

@@ -43,6 +43,7 @@ _ALLOWED_INTERNAL_PRAGMAS = {"data_version"}
 _DEFAULT_SQL_LIMIT = 100
 _MAX_SQL_ROWS = 500
 _TRUNCATED_TEXT_LIMIT = 200
+_FULL_TEXT_SQL_ROW_THRESHOLD = 5
 _MAX_MESSAGE_IDS = 50
 
 
@@ -217,6 +218,7 @@ def _run_read_sql(db_path: Path, sql_text: str, *, truncate_text: bool = True) -
         columns = [str(col[0]) for col in cur.description]
         fetched_rows = cur.fetchmany(_MAX_SQL_ROWS + 1)
         rows = fetched_rows[:_MAX_SQL_ROWS]
+        truncate_text = truncate_text and len(rows) > _FULL_TEXT_SQL_ROW_THRESHOLD
 
         row_dicts: List[Dict[str, Any]] = []
         for row in rows:
@@ -351,8 +353,9 @@ DISCORD_SEARCH_SCHEMA = {
         "1) Search/aggregate with a single read-only SQL SELECT/WITH statement via `sql`. "
         "2) Fetch full untruncated messages for specific IDs via `message_ids`. "
         "The tool always returns CSV with headers.\n\n"
-        f"When using `sql`, any text cell longer than {_TRUNCATED_TEXT_LIMIT} characters is truncated with `...` "
-        "to keep results compact. If you need the full body of specific hits, call the tool again with "
+        f"When using `sql`, text cells are returned in full when the result has {_FULL_TEXT_SQL_ROW_THRESHOLD} rows or fewer. "
+        f"For larger result sets, text cells longer than {_TRUNCATED_TEXT_LIMIT} characters are truncated with `...` "
+        "to keep results compact. If you need the full body of specific hits from larger result sets, call the tool again with "
         "`message_ids` using the message IDs from the search results. "
         f"If your SQL has no top-level LIMIT, the tool automatically adds LIMIT {_DEFAULT_SQL_LIMIT}. "
         f"Regardless of the query text, at most {_MAX_SQL_ROWS} rows are returned. "
@@ -396,7 +399,8 @@ DISCORD_SEARCH_SCHEMA = {
                 "description": (
                     "Single read-only SELECT/WITH query. Use this for search, filtering, aggregation, or FTS. "
                     f"If no top-level LIMIT is present, the tool adds LIMIT {_DEFAULT_SQL_LIMIT}. "
-                    f"Long text cells are truncated to {_TRUNCATED_TEXT_LIMIT} characters with `...`."
+                    f"Text cells are returned in full when the result has {_FULL_TEXT_SQL_ROW_THRESHOLD} rows or fewer; "
+                    f"otherwise long text cells are truncated to {_TRUNCATED_TEXT_LIMIT} characters with `...`."
                 ),
             },
             "message_ids": {

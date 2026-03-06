@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
+from hermes_state import SessionDB
 from run_agent import AIAgent
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS
 
@@ -307,6 +308,7 @@ class TestApiDebugDumps:
             response=MockResponse(),
         )
 
+        assert dump_file.parent == tmp_path / "dumps"
         payload = json.loads(dump_file.read_text())
         assert payload["reason"] == "run_conversation_success"
         assert payload["request"]["url"] == "https://example.test/v1/chat/completions"
@@ -314,6 +316,21 @@ class TestApiDebugDumps:
         assert "timeout" not in payload["request"]["body"]
         assert payload["response"]["body"]["id"] == "resp_123"
         assert payload["response"]["body"]["usage"]["total_tokens"] == 42
+
+    def test_dump_uses_env_override_directory(self, agent, tmp_path, monkeypatch):
+        custom_dump_dir = tmp_path / "custom-dumps"
+        agent.logs_dir = tmp_path / "sessions"
+        agent.session_id = "sess_123"
+        agent.base_url = "https://example.test/v1"
+        agent.client = SimpleNamespace(api_key="test-key-1234567890")
+        monkeypatch.setenv("HERMES_REQUEST_DUMPS_DIR", str(custom_dump_dir))
+
+        dump_file = agent._dump_api_request_debug(
+            {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
+            reason="run_conversation_success",
+        )
+
+        assert dump_file.parent == custom_dump_dir
 
 
 # ===================================================================
@@ -387,6 +404,54 @@ class TestInit:
                 skip_memory=True,
             )
             assert a._use_prompt_caching is False
+
+    def test_reuses_stored_system_prompt_for_existing_session(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(session_id="sess_123", source="discord")
+            db.update_system_prompt("sess_123", "Frozen prompt snapshot")
+
+            with (
+                patch("run_agent.get_tool_definitions", return_value=[]),
+                patch("run_agent.check_toolset_requirements", return_value={}),
+                patch("run_agent.OpenAI"),
+            ):
+                a = AIAgent(
+                    api_key="test-key-1234567890",
+                    session_id="sess_123",
+                    quiet_mode=True,
+                    skip_context_files=True,
+                    skip_memory=True,
+                    session_db=db,
+                )
+
+            assert a._cached_system_prompt == "Frozen prompt snapshot"
+        finally:
+            db.close()
+
+    def test_existing_session_skips_create_session(self):
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {
+            "id": "sess_123",
+            "system_prompt": "Frozen prompt snapshot",
+        }
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                session_id="sess_123",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=mock_db,
+            )
+
+        mock_db.create_session.assert_not_called()
+        assert a._cached_system_prompt == "Frozen prompt snapshot"
 
     def test_valid_tool_names_populated(self):
         """valid_tool_names should contain names from loaded tools."""
@@ -530,6 +595,11 @@ class TestBuildApiKwargs:
         assert kwargs["model"] == agent.model
         assert kwargs["messages"] is messages
         assert kwargs["timeout"] == 900.0
+
+    def test_prompt_cache_control_not_added_to_extra_body(self, agent):
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert "cache_control" not in kwargs["extra_body"]
 
     def test_provider_preferences_injected(self, agent):
         agent.providers_allowed = ["Anthropic"]
@@ -771,6 +841,70 @@ class TestRunConversation:
         assert result["final_response"] == "Done searching"
         assert result["api_calls"] == 2
 
+    def test_prompt_caching_marks_only_final_message_across_tool_loop(self, agent):
+        agent._cached_system_prompt = "You are helpful."
+        agent.tool_delay = 0
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+
+        history = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "prior context"},
+            {"role": "assistant", "content": "prior answer"},
+        ]
+        tc = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Done searching", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something", conversation_history=history)
+
+        assert result["final_response"] == "Done searching"
+
+        calls = agent.client.chat.completions.create.call_args_list
+        assert len(calls) == 2
+
+        first_kwargs = calls[0].kwargs
+        second_kwargs = calls[1].kwargs
+        assert "cache_control" not in first_kwargs["extra_body"]
+        assert "cache_control" not in second_kwargs["extra_body"]
+
+        first_messages = json.loads(json.dumps(first_kwargs["messages"]))
+        second_messages = json.loads(json.dumps(second_kwargs["messages"]))
+
+        first_cache_count = 0
+        for idx, msg in enumerate(first_messages):
+            content = msg.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and "cache_control" in item:
+                        first_cache_count += 1
+                        assert idx == len(first_messages) - 1
+            if "cache_control" in msg:
+                first_cache_count += 1
+                assert idx == len(first_messages) - 1
+        assert first_cache_count == 1
+
+        second_cache_count = 0
+        for idx, msg in enumerate(second_messages):
+            content = msg.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and "cache_control" in item:
+                        second_cache_count += 1
+                        assert idx == len(second_messages) - 1
+            if "cache_control" in msg:
+                second_cache_count += 1
+                assert idx == len(second_messages) - 1
+        assert second_cache_count == 1
+
     def test_request_usage_accumulates_tokens_and_cost(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
@@ -924,7 +1058,7 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        dump_files = sorted(tmp_path.glob("request_dump_*.json"))
+        dump_files = sorted((tmp_path / "dumps").glob("request_dump_*.json"))
         assert result["final_response"] == "Final answer"
         assert len(dump_files) == 1
 

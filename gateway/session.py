@@ -142,6 +142,10 @@ def build_session_context_prompt(context: SessionContext) -> str:
     - Where messages are coming from
     - What platforms are connected
     - Where it can deliver scheduled task outputs
+
+    Avoid embedding the active speaker here. Speaker identity is already present in
+    the per-turn Discord context and keeping it out of the system prompt preserves
+    prompt-cache reuse across different users in the same chat.
     """
     lines = [
         "## Current Session Context",
@@ -155,12 +159,6 @@ def build_session_context_prompt(context: SessionContext) -> str:
     else:
         lines.append(f"**Source:** {platform_name} ({context.source.description})")
 
-    # User identity (especially useful for WhatsApp where multiple people DM)
-    if context.source.user_name:
-        lines.append(f"**User:** {context.source.user_name}")
-    elif context.source.user_id:
-        lines.append(f"**User ID:** {context.source.user_id}")
-    
     # Connected platforms
     platforms_list = ["local (files on this machine)"]
     for p in context.connected_platforms:
@@ -659,14 +657,15 @@ class SessionStore:
 def build_session_context(
     source: SessionSource,
     config: GatewayConfig,
-    session_entry: Optional[SessionEntry] = None
+    session_entry: Optional[SessionEntry] = None,
+    connected_platforms: Optional[List[Platform]] = None,
 ) -> SessionContext:
     """
     Build a full session context from a source and config.
     
     This is used to inject context into the agent's system prompt.
     """
-    connected = config.get_connected_platforms()
+    connected = list(connected_platforms) if connected_platforms is not None else config.get_connected_platforms()
     
     home_channels = {}
     for platform in connected:

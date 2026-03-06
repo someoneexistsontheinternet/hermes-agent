@@ -114,7 +114,7 @@ class TestDiscordSearchExecution:
         assert result["success"] is False
         assert "Only read SQL is allowed" in result["error"]
 
-    def test_search_truncates_long_text_cells(self, monkeypatch, tmp_path):
+    def test_search_returns_full_long_text_cells_for_five_or_fewer_rows(self, monkeypatch, tmp_path):
         db_path = tmp_path / "discord.sqlite"
         _create_archive_db(db_path, row_count=1)
         monkeypatch.setenv("DISCORD_ARCHIVE_DB_PATH", str(db_path))
@@ -131,6 +131,29 @@ class TestDiscordSearchExecution:
             conn.close()
 
         output = discord_search("SELECT message_id, content FROM messages WHERE message_id = '0'")
+        rows = list(csv.reader(io.StringIO(output)))
+
+        assert rows[0] == ["message_id", "content"]
+        assert rows[1][0] == "0"
+        assert rows[1][1] == long_text
+
+    def test_search_truncates_long_text_cells_when_more_than_five_rows(self, monkeypatch, tmp_path):
+        db_path = tmp_path / "discord.sqlite"
+        _create_archive_db(db_path, row_count=6)
+        monkeypatch.setenv("DISCORD_ARCHIVE_DB_PATH", str(db_path))
+
+        long_text = "x" * 240
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "UPDATE messages SET content = ? WHERE message_id = '0'",
+                (long_text,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        output = discord_search("SELECT message_id, content FROM messages ORDER BY created_at ASC LIMIT 6")
         rows = list(csv.reader(io.StringIO(output)))
 
         assert rows[0] == ["message_id", "content"]

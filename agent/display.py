@@ -412,7 +412,12 @@ def get_cute_tool_message(
     if tool_name == "send_message":
         return _wrap(f"┊ 📨 send      {args.get('target', '?')}: \"{_trunc(args.get('message', ''), 25)}\"  {dur}")
     if tool_name == "schedule_cronjob":
-        return _wrap(f"┊ ⏰ schedule  {_trunc(args.get('name', args.get('prompt', 'task')), 30)}  {dur}")
+        target = args.get("name")
+        if not target:
+            target = args.get("prompt")
+        if not target and args.get("from_job_id"):
+            target = f"clone {args.get('from_job_id')}"
+        return _wrap(f"┊ ⏰ schedule  {_trunc(target or 'task', 30)}  {dur}")
     if tool_name == "list_cronjobs":
         return _wrap(f"┊ ⏰ jobs      listing  {dur}")
     if tool_name == "remove_cronjob":
