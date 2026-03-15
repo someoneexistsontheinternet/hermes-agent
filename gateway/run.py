@@ -113,6 +113,7 @@ from gateway.config import (
 )
 from gateway.session import (
     SessionStore,
+    SessionEntry,
     SessionSource,
     SessionContext,
     build_session_context,
@@ -646,6 +647,254 @@ class GatewayRunner:
         if not trimmed:
             return summary
         return f"{trimmed}\n\n{summary}"
+
+    @staticmethod
+    def _new_delivery_state(
+        source: SessionSource,
+        event: Optional[MessageEvent] = None,
+    ) -> Dict[str, Any]:
+        """Create a fresh delivery-state object for one inbound event."""
+        return {
+            "chat_id": source.chat_id,
+            "reply_to": getattr(event, "message_id", None),
+            "thread_result": None,
+            "thread_source": None,
+            "thread_session_id": None,
+            "thread_session_key": None,
+            "transcript_notice": None,
+            "main_notice": None,
+            "main_notice_sent": False,
+            "thread_transcript_recorded": False,
+        }
+
+    @staticmethod
+    def _same_speaker(left: Optional[SessionSource], right: Optional[SessionSource]) -> bool:
+        """Return True when two sources appear to be the same human speaker."""
+        if left is None or right is None:
+            return False
+
+        left_id = str(getattr(left, "user_id", "") or "").strip()
+        right_id = str(getattr(right, "user_id", "") or "").strip()
+        if left_id and right_id:
+            return left_id == right_id
+
+        left_name = str(getattr(left, "user_name", "") or "").strip()
+        right_name = str(getattr(right, "user_name", "") or "").strip()
+        return bool(left_name and right_name and left_name == right_name)
+
+    @staticmethod
+    def _discord_interrupt_note(
+        previous_source: Optional[SessionSource],
+        current_source: Optional[SessionSource],
+    ) -> str:
+        """Build a short system note when another Discord user takes over a turn."""
+        if current_source is None or current_source.platform != Platform.DISCORD:
+            return ""
+        current_user = str(current_source.user_name or current_source.user_id or "unknown").strip() or "unknown"
+        previous_user = str(
+            getattr(previous_source, "user_name", None)
+            or getattr(previous_source, "user_id", None)
+            or "another user"
+        ).strip() or "another user"
+        return (
+            "[System note: The previous in-progress reply for this Discord chat "
+            f"(started for {previous_user}) was interrupted by a new message from {current_user}. "
+            "Ignore the interrupted task and answer the new speaker instead.]"
+        )
+
+    def _discord_reply_context_from_event(
+        self,
+        event: Optional[MessageEvent],
+        source: Optional[SessionSource],
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve author + preview for the message this Discord turn replies to."""
+        if event is None or source is None or source.platform != Platform.DISCORD:
+            return None
+
+        reply_id = str(getattr(event, "reply_to_message_id", "") or "").strip()
+        if not reply_id:
+            return None
+
+        adapter = self._live_discord_adapter()
+        archive_db = getattr(adapter, "_archive_db", None) if adapter else None
+        resolver = getattr(archive_db, "get_reply_context", None)
+        if not callable(resolver):
+            return None
+
+        reference = getattr(getattr(event, "raw_message", None), "reference", None)
+        reply_channel_id = str(getattr(reference, "channel_id", "") or "").strip()
+        if not reply_channel_id:
+            reply_channel_id = str(source.chat_id or "").strip()
+
+        try:
+            return resolver(message_id=reply_id, channel_id=reply_channel_id or None)
+        except Exception as e:
+            logger.debug("Discord reply-context lookup failed (%s): %s", reply_id, e)
+            return None
+
+    async def _build_event_message_payload(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        *,
+        interrupt_note: str = "",
+    ) -> tuple[Any, str]:
+        """Build the user payload sent to the model for one inbound event."""
+        message_text = event.text or ""
+        image_items = self._collect_multimodal_image_items(event)
+        supports_direct_multimodal = False
+        if image_items:
+            model_name = self._current_model_name()
+            supports_direct_multimodal = self._model_supports_direct_multimodal(model_name)
+            if not supports_direct_multimodal:
+                image_paths = [item["path"] for item in image_items]
+                message_text = await self._enrich_message_with_vision(
+                    message_text, image_paths
+                )
+
+        if event.media_urls:
+            audio_paths = []
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                is_audio = (
+                    mtype.startswith("audio/")
+                    or event.message_type in (MessageType.VOICE, MessageType.AUDIO)
+                )
+                if is_audio:
+                    audio_paths.append(path)
+            if audio_paths:
+                message_text = await self._enrich_message_with_transcription(
+                    message_text, audio_paths
+                )
+
+        if event.media_urls and event.message_type == MessageType.DOCUMENT:
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                if not (mtype.startswith("application/") or mtype.startswith("text/")):
+                    continue
+                import os as _os
+                basename = _os.path.basename(path)
+                parts = basename.split("_", 2)
+                display_name = parts[2] if len(parts) >= 3 else basename
+                import re as _re
+                display_name = _re.sub(r"[^\w.\- ]", "_", display_name)
+
+                if mtype.startswith("text/"):
+                    context_note = (
+                        f"[The user sent a text document: '{display_name}'. "
+                        f"Its content has been included below. "
+                        f"The file is also saved at: {path}]"
+                    )
+                else:
+                    context_note = (
+                        f"[The user sent a document: '{display_name}'. "
+                        f"The file is saved at: {path}. "
+                        f"Ask the user what they'd like you to do with it.]"
+                    )
+                message_text = f"{context_note}\n\n{message_text}"
+
+        extra_context = (getattr(event, "extra_context", "") or "").strip()
+        prefix_parts: List[str] = []
+        if interrupt_note:
+            prefix_parts.append(interrupt_note.strip())
+
+        if extra_context:
+            use_discord_context_only = (
+                source.platform == Platform.DISCORD
+                and event.message_type == MessageType.TEXT
+                and not event.media_urls
+            )
+            if use_discord_context_only:
+                reply_context = self._discord_reply_context_from_event(event, source)
+                request_summary = self._discord_request_summary(
+                    source,
+                    event.text or "",
+                    reply_context=reply_context,
+                )
+                prefix_parts.extend([extra_context, request_summary])
+                message_text = "\n\n".join(part for part in prefix_parts if part).strip()
+            else:
+                prefix_parts.extend([extra_context, message_text])
+                message_text = "\n\n".join(part for part in prefix_parts if part).strip()
+        elif prefix_parts:
+            prefix_parts.append(message_text)
+            message_text = "\n\n".join(part for part in prefix_parts if part).strip()
+
+        message_payload: Any = message_text
+        if image_items and supports_direct_multimodal:
+            multimodal_payload = self._build_multimodal_user_payload(message_text, image_items)
+            if multimodal_payload:
+                message_payload = multimodal_payload
+            else:
+                image_paths = [item["path"] for item in image_items]
+                if image_paths:
+                    message_text = await self._enrich_message_with_vision(
+                        message_text, image_paths
+                    )
+                    message_payload = message_text
+
+        return message_payload, message_text
+
+    async def _prepare_agent_turn_state(
+        self,
+        source: SessionSource,
+        event: MessageEvent,
+    ) -> Dict[str, Any]:
+        """Resolve session, prompt, history, and user payload for one inbound turn."""
+        force_auto_reset = bool(getattr(event, "force_auto_reset", False))
+        auto_reset_reason = str(getattr(event, "auto_reset_reason", "") or "").strip()
+        session_entry = self.session_store.get_or_create_session(
+            source,
+            force_auto_reset=force_auto_reset,
+        )
+        session_key = session_entry.session_key
+
+        context = build_session_context(
+            source,
+            self.config,
+            session_entry,
+            connected_platforms=self._connected_platforms(),
+        )
+        self._set_session_env(context)
+
+        context_prompt = build_session_context_prompt(context)
+        auto_fork_note = self._discord_auto_fork_prompt_note(source)
+        if auto_fork_note:
+            context_prompt = f"{context_prompt}\n\n{auto_fork_note}"
+
+        if getattr(session_entry, "was_auto_reset", False):
+            if auto_reset_reason:
+                note = (
+                    "[System note: The previous session was automatically reset "
+                    f"before this turn ({auto_reset_reason}). "
+                    "This is a fresh conversation with no prior context.]"
+                )
+            else:
+                note = (
+                    "[System note: The user's previous session expired due to inactivity. "
+                    "This is a fresh conversation with no prior context.]"
+                )
+            context_prompt = note + "\n\n" + context_prompt
+            session_entry.was_auto_reset = False
+
+        history = self._collapse_trailing_fork_handoffs(
+            self.session_store.load_transcript(session_entry.session_id),
+            source=source,
+        )
+        message_payload, message_text = await self._build_event_message_payload(
+            event,
+            source,
+        )
+
+        return {
+            "session_entry": session_entry,
+            "session_id": session_entry.session_id,
+            "session_key": session_key,
+            "context_prompt": context_prompt,
+            "history": history,
+            "message_payload": message_payload,
+            "message_text": message_text,
+        }
     
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -870,62 +1119,13 @@ class GatewayRunner:
                 return "❌ Command denied."
             # If it's not clearly an approval/denial, fall through to normal processing
         
-        # Get or create session
-        force_auto_reset = bool(getattr(event, "force_auto_reset", False))
-        auto_reset_reason = str(getattr(event, "auto_reset_reason", "") or "").strip()
-        session_entry = self.session_store.get_or_create_session(
-            source,
-            force_auto_reset=force_auto_reset,
-        )
-        session_key = session_entry.session_key
-        
-        # Build session context
-        context = build_session_context(
-            source,
-            self.config,
-            session_entry,
-            connected_platforms=self._connected_platforms(),
-        )
-        
-        # Set environment variables for tools
-        self._set_session_env(context)
-        
-        # Build the context prompt to inject
-        context_prompt = build_session_context_prompt(context)
-        auto_fork_note = self._discord_auto_fork_prompt_note(source)
-        if auto_fork_note:
-            context_prompt = f"{context_prompt}\n\n{auto_fork_note}"
-        extra_context = (getattr(event, "extra_context", "") or "").strip()
-        
-        # If the previous session expired and was auto-reset, prepend a notice
-        # so the agent knows this is a fresh conversation (not an intentional /reset).
-        if getattr(session_entry, 'was_auto_reset', False):
-            if auto_reset_reason:
-                note = (
-                    "[System note: The previous session was automatically reset "
-                    f"before this turn ({auto_reset_reason}). "
-                    "This is a fresh conversation with no prior context.]"
-                )
-            else:
-                note = (
-                    "[System note: The user's previous session expired due to inactivity. "
-                    "This is a fresh conversation with no prior context.]"
-                )
-            context_prompt = note + "\n\n" + context_prompt
-            session_entry.was_auto_reset = False
-        
-        # Load conversation history from transcript.
-        #
-        # After a Discord main-channel fork, the persisted parent session ends
-        # with a fork handoff sequence:
-        #   user -> assistant(fork_thread) -> tool(success) -> assistant("[Continued in thread ...]")
-        # Keep that full trail in the transcript for auditability, but collapse
-        # it into one compact routing note for future parent-channel model
-        # history so later pings know the topic already has a thread.
-        history = self._collapse_trailing_fork_handoffs(
-            self.session_store.load_transcript(session_entry.session_id),
-            source=source,
-        )
+        turn_state = await self._prepare_agent_turn_state(source, event)
+        session_entry = turn_state["session_entry"]
+        session_key = turn_state["session_key"]
+        context_prompt = turn_state["context_prompt"]
+        history = turn_state["history"]
+        message_payload = turn_state["message_payload"]
+        message_text = turn_state["message_text"]
         
         # First-message onboarding -- only on the very first interaction ever
         if not history and not self.session_store.has_any_sessions():
@@ -950,116 +1150,9 @@ class GatewayRunner:
                         f"Type /sethome to make this chat your home channel, "
                         f"or ignore to skip."
                     )
-        
-        # -----------------------------------------------------------------
-        # Image handling strategy
-        #
-        # For OpenAI/Gemini/Anthropic model families, send image_url parts
-        # directly in the user content payload (multimodal). For other models,
-        # keep the existing vision pre-analysis fallback path.
-        # -----------------------------------------------------------------
-        message_text = event.text or ""
-        image_items = self._collect_multimodal_image_items(event)
-        supports_direct_multimodal = False
-        if image_items:
-            model_name = self._current_model_name()
-            supports_direct_multimodal = self._model_supports_direct_multimodal(model_name)
-            if not supports_direct_multimodal:
-                image_paths = [item["path"] for item in image_items]
-                message_text = await self._enrich_message_with_vision(
-                    message_text, image_paths
-                )
-        
-        # -----------------------------------------------------------------
-        # Auto-transcribe voice/audio messages sent by the user
-        # -----------------------------------------------------------------
-        if event.media_urls:
-            audio_paths = []
-            for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                is_audio = (
-                    mtype.startswith("audio/")
-                    or event.message_type in (MessageType.VOICE, MessageType.AUDIO)
-                )
-                if is_audio:
-                    audio_paths.append(path)
-            if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
-                    message_text, audio_paths
-                )
-
-        # -----------------------------------------------------------------
-        # Enrich document messages with context notes for the agent
-        # -----------------------------------------------------------------
-        if event.media_urls and event.message_type == MessageType.DOCUMENT:
-            for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                if not (mtype.startswith("application/") or mtype.startswith("text/")):
-                    continue
-                # Extract display filename by stripping the doc_{uuid12}_ prefix
-                import os as _os
-                basename = _os.path.basename(path)
-                # Format: doc_<12hex>_<original_filename>
-                parts = basename.split("_", 2)
-                display_name = parts[2] if len(parts) >= 3 else basename
-                # Sanitize to prevent prompt injection via filenames
-                import re as _re
-                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
-
-                if mtype.startswith("text/"):
-                    context_note = (
-                        f"[The user sent a text document: '{display_name}'. "
-                        f"Its content has been included below. "
-                        f"The file is also saved at: {path}]"
-                    )
-                else:
-                    context_note = (
-                        f"[The user sent a document: '{display_name}'. "
-                        f"The file is saved at: {path}. "
-                        f"Ask the user what they'd like you to do with it.]"
-                    )
-                message_text = f"{context_note}\n\n{message_text}"
-
-        # Keep Discord channel context in the user turn (not in system prompt).
-        if extra_context:
-            # For plain Discord text turns, rely on the injected Discord context
-            # block as the full user payload (it already includes the current turn).
-            use_discord_context_only = (
-                source.platform == Platform.DISCORD
-                and event.message_type == MessageType.TEXT
-                and not event.media_urls
-            )
-            if use_discord_context_only:
-                message_text = extra_context
-            else:
-                message_text = f"{extra_context}\n\n{message_text}".strip()
-
-        message_payload: Any = message_text
-        if image_items and supports_direct_multimodal:
-            multimodal_payload = self._build_multimodal_user_payload(message_text, image_items)
-            if multimodal_payload:
-                message_payload = multimodal_payload
-            else:
-                image_paths = [item["path"] for item in image_items]
-                if image_paths:
-                    message_text = await self._enrich_message_with_vision(
-                        message_text, image_paths
-                    )
-                    message_payload = message_text
 
         try:
-            delivery_state = {
-                "chat_id": source.chat_id,
-                "reply_to": event.message_id,
-                "thread_result": None,
-                "thread_source": None,
-                "thread_session_id": None,
-                "thread_session_key": None,
-                "transcript_notice": None,
-                "main_notice": None,
-                "main_notice_sent": False,
-                "thread_transcript_recorded": False,
-            }
+            delivery_state = self._new_delivery_state(source, event)
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -1087,8 +1180,12 @@ class GatewayRunner:
                 agent_result=agent_result,
                 source=source,
             )
+            setattr(event, "_response_chat_id", str(delivery_state.get("chat_id") or source.chat_id))
+            setattr(event, "_response_reply_to_message_id", delivery_state.get("reply_to"))
             agent_messages = agent_result.get("messages", [])
             use_delivery_response = True
+            if agent_result.get("deferred_pending_event"):
+                setattr(event, "_response_handled", True)
             
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -1149,7 +1246,7 @@ class GatewayRunner:
             main_channel_response = response
             transcript_notice = None
             fork_request = None
-            if response and delivery_state.get("thread_result") and delivery_state.get("thread_source"):
+            if delivery_state.get("thread_result") and delivery_state.get("thread_source"):
                 thread_result = delivery_state["thread_result"]
                 thread_source = delivery_state["thread_source"]
                 thread_mention = str(thread_result.get("thread_mention") or f"<#{thread_result['thread_id']}>")
@@ -1163,16 +1260,16 @@ class GatewayRunner:
                     transcript_notice=transcript_notice,
                     thread_mention=thread_mention,
                 )
-                if not delivery_state.get("thread_transcript_recorded"):
+                if response and not delivery_state.get("thread_transcript_recorded"):
                     self._append_thread_fork_transcript(
                         thread_source=thread_source,
                         original_source=source,
-                        message_text=message_text,
+                        request_text=str(getattr(event, "text", "") or message_text),
                         response=response,
                         tool_defs=tool_defs,
                     )
                     delivery_state["thread_transcript_recorded"] = True
-                main_channel_response = response
+                main_channel_response = response or main_channel_response
             else:
                 fork_request = self._extract_fork_thread_request(new_messages)
             if response and not delivery_state.get("thread_result") and fork_request:
@@ -1375,6 +1472,37 @@ class GatewayRunner:
         )
 
     @staticmethod
+    def _discord_request_summary(
+        source: SessionSource,
+        request_text: str,
+        *,
+        reply_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Build a compact per-turn Discord summary for the active speaker."""
+        current_user = str(source.user_name or source.user_id or "unknown").strip() or "unknown"
+        request = str(request_text or "").strip()
+        lines: List[str] = []
+        if reply_context:
+            reply_author = str(
+                reply_context.get("author_display")
+                or reply_context.get("author_name")
+                or reply_context.get("author_id")
+                or "unknown"
+            ).strip() or "unknown"
+            reply_preview = str(reply_context.get("preview") or "").strip()
+            if reply_preview:
+                lines.append(f'**Replying to {reply_author}**: "{reply_preview}"')
+            else:
+                lines.append(f"**Replying to {reply_author}**")
+        lines.append(f"**Current user**: {current_user}")
+        if "\n" in request:
+            lines.append("**Request**:")
+            lines.append(request)
+            return "\n".join(lines)
+        lines.append(f"**Request**: {request}")
+        return "\n".join(lines)
+
+    @staticmethod
     def _extract_fork_thread_request(messages: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
         """Extract the most recent successful fork_thread tool request from new messages."""
         tool_names: Dict[str, str] = {}
@@ -1570,16 +1698,27 @@ class GatewayRunner:
         )
         return rewritten
 
-    def _append_thread_fork_transcript(
+    @staticmethod
+    def _build_forked_user_transcript_content(
+        original_source: SessionSource,
+        request_text: str,
+    ) -> str:
+        """Render the user turn recorded in a forked thread transcript."""
+        origin_label = original_source.chat_name or original_source.chat_id
+        user_content = str(request_text or "").strip()
+        if origin_label:
+            user_content = f"[Forked from {origin_label}] {user_content}".strip()
+        return user_content
+
+    def _ensure_thread_fork_transcript_seeded(
         self,
         *,
         thread_source: SessionSource,
         original_source: SessionSource,
-        message_text: str,
-        response: str,
+        request_text: str,
         tool_defs: List[Dict[str, Any]],
-    ) -> None:
-        """Seed the new thread session with the forked user turn and assistant reply."""
+    ) -> SessionEntry:
+        """Ensure the forked thread transcript has session metadata and the user turn."""
         thread_entry = self.session_store.get_or_create_session(thread_source)
         thread_history = self.session_store.load_transcript(thread_entry.session_id)
         ts = datetime.now().isoformat()
@@ -1595,16 +1734,55 @@ class GatewayRunner:
                     "timestamp": ts,
                 },
             )
+            thread_history = self.session_store.load_transcript(thread_entry.session_id)
 
-        origin_label = original_source.chat_name or original_source.chat_id
-        user_content = message_text
-        if origin_label:
-            user_content = f"[Forked from {origin_label}] {message_text}".strip()
-
-        self.session_store.append_to_transcript(
-            thread_entry.session_id,
-            {"role": "user", "content": user_content, "timestamp": ts},
+        user_content = self._build_forked_user_transcript_content(
+            original_source,
+            request_text,
         )
+        has_user_turn = any(
+            msg.get("role") == "user"
+            and str(msg.get("content") or "") == user_content
+            for msg in thread_history
+        )
+        if not has_user_turn:
+            self.session_store.append_to_transcript(
+                thread_entry.session_id,
+                {"role": "user", "content": user_content, "timestamp": ts},
+            )
+
+        self.session_store.update_session(thread_entry.session_key)
+        return thread_entry
+
+    def _append_thread_fork_transcript(
+        self,
+        *,
+        thread_source: SessionSource,
+        original_source: SessionSource,
+        request_text: str,
+        response: str,
+        tool_defs: List[Dict[str, Any]],
+    ) -> None:
+        """Seed the new thread session with the forked user turn and assistant reply."""
+        thread_entry = self._ensure_thread_fork_transcript_seeded(
+            thread_source=thread_source,
+            original_source=original_source,
+            request_text=request_text,
+            tool_defs=tool_defs,
+        )
+        thread_history = self.session_store.load_transcript(thread_entry.session_id)
+        last_non_meta = next(
+            (msg for msg in reversed(thread_history) if msg.get("role") != "session_meta"),
+            None,
+        )
+        if (
+            last_non_meta is not None
+            and last_non_meta.get("role") == "assistant"
+            and str(last_non_meta.get("content") or "") == str(response or "")
+        ):
+            return
+
+        ts = datetime.now().isoformat()
         self.session_store.append_to_transcript(
             thread_entry.session_id,
             {"role": "assistant", "content": response, "timestamp": ts},
@@ -1636,6 +1814,8 @@ class GatewayRunner:
         title: str,
         visibility: str,
         reason: str,
+        request_text: str = "",
+        tool_defs: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Create the fork thread immediately and switch live delivery to it."""
         if delivery_state.get("thread_result"):
@@ -1689,6 +1869,12 @@ class GatewayRunner:
 
         thread_source = self._build_thread_source(source, thread_result)
         thread_entry = self.session_store.get_or_create_session(thread_source)
+        self._ensure_thread_fork_transcript_seeded(
+            thread_source=thread_source,
+            original_source=source,
+            request_text=request_text or str(getattr(event, "text", "") or ""),
+            tool_defs=tool_defs or [],
+        )
 
         delivery_state["thread_result"] = thread_result
         delivery_state["thread_source"] = thread_source
@@ -1811,7 +1997,7 @@ class GatewayRunner:
         self._append_thread_fork_transcript(
             thread_source=thread_source,
             original_source=source,
-            message_text=message_text,
+            request_text=str(getattr(event, "text", "") or message_text),
             response=response,
             tool_defs=tool_defs,
         )
@@ -2952,6 +3138,8 @@ class GatewayRunner:
                         title=title,
                         visibility=visibility,
                         reason=reason,
+                        request_text=str(getattr(event, "text", "") or ""),
+                        tool_defs=tools_holder[0] or [],
                     ),
                     main_loop,
                 )
@@ -3186,13 +3374,13 @@ class GatewayRunner:
             
             # Get pending message from adapter if interrupted
             pending = None
+            pending_event = None
             if result and result.get("interrupted") and adapter:
                 pending_chat_ids = [source.chat_id]
                 current_chat_id = str(delivery_state.get("chat_id") or "").strip()
                 if current_chat_id and current_chat_id not in pending_chat_ids:
                     pending_chat_ids.append(current_chat_id)
 
-                pending_event = None
                 for chat_id in pending_chat_ids:
                     pending_event = adapter.get_pending_message(chat_id)
                     if pending_event:
@@ -3208,24 +3396,69 @@ class GatewayRunner:
                 # Clear the adapter's interrupt event so the next _run_agent call
                 # doesn't immediately re-trigger the interrupt before the new agent
                 # even makes its first API call (this was causing an infinite loop).
-                if adapter and hasattr(adapter, '_active_sessions') and source.chat_id in adapter._active_sessions:
-                    adapter._active_sessions[source.chat_id].clear()
+                if adapter and hasattr(adapter, "_active_sessions"):
+                    for chat_id in pending_chat_ids:
+                        if chat_id in adapter._active_sessions:
+                            adapter._active_sessions[chat_id].clear()
                 
                 # Don't send the interrupted response to the user — it's just noise
                 # like "Operation interrupted." They already know they sent a new
                 # message, so go straight to processing it.
                 
                 # Now process the pending message with updated history
-                updated_history = result.get("messages", history)
+                pending_source = pending_event.source if pending_event and pending_event.source else source
+                thread_source = delivery_state.get("thread_source") if isinstance(delivery_state, dict) else None
+                thread_session_id = str(
+                    delivery_state.get("thread_session_id") or ""
+                ).strip() if isinstance(delivery_state, dict) else ""
+                thread_chat_id = str(getattr(thread_source, "chat_id", "") or "").strip()
+                pending_chat_id = str(getattr(pending_source, "chat_id", "") or "").strip()
+                source_chat_id = str(getattr(source, "chat_id", "") or "").strip()
+                crossed_fork_boundary = bool(
+                    pending_event
+                    and thread_session_id
+                    and thread_chat_id
+                    and pending_chat_id == thread_chat_id
+                    and pending_chat_id != source_chat_id
+                )
+                pending_store = getattr(adapter, "_pending_messages", None) if adapter else None
+                if crossed_fork_boundary and isinstance(pending_store, dict):
+                    pending_store[pending_chat_id] = pending_event
+                    deferred_response = dict(response or {})
+                    deferred_response["final_response"] = ""
+                    deferred_response["deferred_pending_event"] = True
+                    deferred_response["interrupted_handoff"] = True
+                    return deferred_response
+
+                speaker_changed = bool(pending_event) and not self._same_speaker(source, pending_source)
+                updated_history = history if speaker_changed else result.get("messages", history)
+                resumed_event = pending_event or event
+                resumed_source = pending_source if pending_event else source
+                resumed_delivery_state = delivery_state if isinstance(delivery_state, dict) else {}
+                resumed_delivery_state.clear()
+                resumed_delivery_state.update(
+                    self._new_delivery_state(resumed_source, resumed_event)
+                )
+                resumed_message = pending
+                if pending_event:
+                    interrupt_note = (
+                        self._discord_interrupt_note(source, pending_source)
+                        if speaker_changed else ""
+                    )
+                    resumed_message, _ = await self._build_event_message_payload(
+                        pending_event,
+                        pending_source,
+                        interrupt_note=interrupt_note,
+                    )
                 return await self._run_agent(
-                    message=pending,
+                    message=resumed_message,
                     context_prompt=context_prompt,
                     history=updated_history,
-                    source=source,
+                    source=resumed_source,
                     session_id=session_id,
                     session_key=session_key,
-                    event=event,
-                    delivery_state=delivery_state,
+                    event=resumed_event,
+                    delivery_state=resumed_delivery_state,
                 )
         finally:
             # Stop progress sender and interrupt monitor

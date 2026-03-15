@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT,
     attachments_json TEXT,
     reactions_json TEXT,
+    reply_to_message_id TEXT,
+    reply_to_channel_id TEXT,
+    reply_to_guild_id TEXT,
     created_at REAL NOT NULL,
     edited_at REAL,
     deleted INTEGER NOT NULL DEFAULT 0
@@ -192,6 +195,9 @@ class DiscordArchiveDB:
         cursor = self._conn.cursor()
         cursor.executescript(SCHEMA_SQL)
         self._ensure_column("messages", "reactions_json", "TEXT")
+        self._ensure_column("messages", "reply_to_message_id", "TEXT")
+        self._ensure_column("messages", "reply_to_channel_id", "TEXT")
+        self._ensure_column("messages", "reply_to_guild_id", "TEXT")
         try:
             cursor.execute("SELECT * FROM discord_messages_fts LIMIT 0")
         except sqlite3.OperationalError:
@@ -272,6 +278,74 @@ class DiscordArchiveDB:
         if not row:
             return None
         return self._message_row_to_dict(row)
+
+    def get_reply_context(
+        self,
+        *,
+        message_id: str,
+        channel_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return author + preview fields for one reply target message."""
+        reply_id = str(message_id or "").strip()
+        if not reply_id:
+            return None
+
+        row = None
+        if channel_id:
+            row = self._conn.execute(
+                """
+                SELECT
+                    message_id,
+                    author_id,
+                    author_name,
+                    author_display,
+                    author_is_bot,
+                    content,
+                    deleted
+                FROM messages
+                WHERE channel_id = ? AND message_id = ?
+                LIMIT 1
+                """,
+                (str(channel_id), reply_id),
+            ).fetchone()
+
+        if row is None:
+            row = self._conn.execute(
+                """
+                SELECT
+                    message_id,
+                    author_id,
+                    author_name,
+                    author_display,
+                    author_is_bot,
+                    content,
+                    deleted
+                FROM messages
+                WHERE message_id = ?
+                LIMIT 1
+                """,
+                (reply_id,),
+            ).fetchone()
+
+        if not row:
+            return None
+
+        author_display = (
+            row["author_display"]
+            or row["author_name"]
+            or row["author_id"]
+            or "unknown"
+        )
+        deleted = bool(row["deleted"])
+        return {
+            "message_id": str(row["message_id"]),
+            "author_id": row["author_id"],
+            "author_name": row["author_name"],
+            "author_display": author_display,
+            "author_is_bot": bool(row["author_is_bot"]),
+            "deleted": deleted,
+            "preview": self._reply_preview(row["content"], deleted),
+        }
 
     def get_thread_seed(self, thread_id: str) -> Optional[Dict[str, Any]]:
         """Return persisted seed context for one thread."""
@@ -619,15 +693,20 @@ class DiscordArchiveDB:
         reactions = msg.get("reactions_json", msg.get("reactions"))
         if reactions is not None and not isinstance(reactions, str):
             reactions = json.dumps(reactions, ensure_ascii=False)
+        reply_to_message_id = str(msg.get("reply_to_message_id") or "").strip() or None
+        reply_to_channel_id = str(msg.get("reply_to_channel_id") or "").strip() or None
+        reply_to_guild_id = str(msg.get("reply_to_guild_id") or "").strip() or None
 
         self._conn.execute(
             """
             INSERT INTO messages(
                 message_id, guild_id, guild_name, channel_id, channel_name, thread_id,
                 author_id, author_name, author_display, author_is_bot,
-                content, attachments_json, reactions_json, created_at, edited_at, deleted
+                content, attachments_json, reactions_json,
+                reply_to_message_id, reply_to_channel_id, reply_to_guild_id,
+                created_at, edited_at, deleted
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(message_id) DO UPDATE SET
                 guild_id = excluded.guild_id,
                 guild_name = excluded.guild_name,
@@ -641,6 +720,9 @@ class DiscordArchiveDB:
                 content = excluded.content,
                 attachments_json = excluded.attachments_json,
                 reactions_json = COALESCE(excluded.reactions_json, messages.reactions_json),
+                reply_to_message_id = excluded.reply_to_message_id,
+                reply_to_channel_id = excluded.reply_to_channel_id,
+                reply_to_guild_id = excluded.reply_to_guild_id,
                 edited_at = excluded.edited_at,
                 deleted = excluded.deleted
             """,
@@ -658,6 +740,9 @@ class DiscordArchiveDB:
                 msg.get("content"),
                 attachments,
                 reactions,
+                reply_to_message_id,
+                reply_to_channel_id,
+                reply_to_guild_id,
                 created_at,
                 edited_at,
                 deleted,
@@ -669,6 +754,15 @@ class DiscordArchiveDB:
     @staticmethod
     def _normalize_content(content: Optional[str]) -> str:
         return " ".join((content or "").split()).strip()
+
+    @staticmethod
+    def _reply_preview(content: Optional[str], deleted: bool) -> str:
+        if deleted:
+            return "[Deleted]"
+        normalized = " ".join((content or "").split()).strip()
+        if not normalized:
+            return "[non-text message]"
+        return normalized[:50]
 
     def record_message_edit(
         self,
@@ -929,10 +1023,76 @@ class DiscordArchiveDB:
             "attachments": attachments,
             "reactions_json": raw_reactions,
             "reactions": reactions,
+            "reply_to_message_id": row["reply_to_message_id"] if "reply_to_message_id" in row.keys() else None,
+            "reply_to_channel_id": row["reply_to_channel_id"] if "reply_to_channel_id" in row.keys() else None,
+            "reply_to_guild_id": row["reply_to_guild_id"] if "reply_to_guild_id" in row.keys() else None,
             "created_at": row["created_at"],
             "edited_at": row["edited_at"],
             "deleted": bool(row["deleted"]),
         }
+
+    def enrich_reply_context_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Attach reply target author/preview fields for context rendering."""
+        if not rows:
+            return rows
+
+        ordered_ids: List[str] = []
+        seen_ids = set()
+        for row in rows:
+            reply_id = str(row.get("reply_to_message_id") or "").strip()
+            if not reply_id or reply_id in seen_ids:
+                continue
+            seen_ids.add(reply_id)
+            ordered_ids.append(reply_id)
+
+        if not ordered_ids:
+            return rows 
+
+        placeholders = ",".join("?" for _ in ordered_ids)
+        cur = self._conn.execute(
+            f"""
+            SELECT
+                message_id,
+                author_id,
+                author_name,
+                author_display,
+                content,
+                deleted
+            FROM messages
+            WHERE message_id IN ({placeholders})
+            """,
+            ordered_ids,
+        )
+        parent_rows = {
+            str(row["message_id"]): {
+                "author_display": row["author_display"],
+                "author_name": row["author_name"],
+                "author_id": row["author_id"],
+                "content": row["content"],
+                "deleted": bool(row["deleted"]),
+            }
+            for row in cur.fetchall()
+        }
+
+        enriched_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            enriched = dict(row)
+            reply_id = str(row.get("reply_to_message_id") or "").strip()
+            if reply_id:
+                parent = parent_rows.get(reply_id)
+                if parent:
+                    enriched["reply_author_display"] = (
+                        parent.get("author_display")
+                        or parent.get("author_name")
+                        or parent.get("author_id")
+                        or "unknown"
+                    )
+                    enriched["reply_preview"] = self._reply_preview(
+                        parent.get("content"),
+                        bool(parent.get("deleted")),
+                    )
+            enriched_rows.append(enriched)
+        return enriched_rows
 
     def _change_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         keys = set(row.keys())

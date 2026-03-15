@@ -23,6 +23,7 @@ def _create_archive_db(db_path: Path, row_count: int) -> None:
                 channel_id TEXT NOT NULL,
                 author_name TEXT,
                 content TEXT,
+                reply_to_message_id TEXT,
                 created_at REAL NOT NULL,
                 deleted INTEGER NOT NULL DEFAULT 0
             );
@@ -184,6 +185,28 @@ class TestDiscordSearchExecution:
         assert rows[1][0] == "1"
         assert rows[1][4] == long_text
         assert rows[2][0] == "0"
+
+    def test_sql_mode_can_select_reply_to_message_id(self, monkeypatch, tmp_path):
+        db_path = tmp_path / "discord.sqlite"
+        _create_archive_db(db_path, row_count=2)
+        monkeypatch.setenv("DISCORD_ARCHIVE_DB_PATH", str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "UPDATE messages SET reply_to_message_id = '0' WHERE message_id = '1'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        output = discord_search(
+            "SELECT message_id, reply_to_message_id FROM messages WHERE message_id = '1'"
+        )
+        rows = list(csv.reader(io.StringIO(output)))
+
+        assert rows[0] == ["message_id", "reply_to_message_id"]
+        assert rows[1] == ["1", "0"]
 
     def test_fts_count_query_is_allowed(self, monkeypatch, tmp_path):
         db_path = tmp_path / "discord.sqlite"

@@ -62,7 +62,7 @@ def test_reset_command_clears_discord_channel_context(tmp_path):
     assert "Session reset" in response
 
 
-def test_discord_plain_text_turn_uses_context_without_duplicate_tail(tmp_path):
+def test_discord_plain_text_turn_appends_current_user_and_request(tmp_path):
     runner = GatewayRunner(
         GatewayConfig(sessions_dir=tmp_path / "sessions")
     )
@@ -103,7 +103,219 @@ def test_discord_plain_text_turn_uses_context_without_duplicate_tail(tmp_path):
     response = asyncio.run(runner._handle_message(event))
 
     assert response == "ok"
-    assert captured["message"] == extra_context
+    assert captured["message"] == (
+        f"{extra_context}\n\n"
+        "**Current user**: giftedgummybee\n"
+        "**Request**: what is 3+4?"
+    )
+
+
+def test_discord_plain_text_turn_appends_reply_context_for_current_turn(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+
+    extra_context = "[Discord context]\n00:11 giftedgummybee: previous message"
+    captured = {}
+
+    async def _fake_run_agent(*, message, **kwargs):
+        captured["message"] = message
+        return {
+            "final_response": "ok",
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "ok"},
+            ],
+            "history_input_len": 0,
+            "tools": [],
+        }
+
+    runner._run_agent = _fake_run_agent
+
+    class _FakeDiscordAdapter:
+        is_connected = True
+        _archive_db = SimpleNamespace(
+            get_reply_context=lambda **kwargs: {
+                "author_display": "Hermes-Bot",
+                "preview": "2 plus 2 equals 4",
+            }
+        )
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SimpleNamespace(success=True)
+
+    runner.adapters[Platform.DISCORD] = _FakeDiscordAdapter()
+
+    event = MessageEvent(
+        text="what is 3+4?",
+        message_type=MessageType.TEXT,
+        source=source,
+        extra_context=extra_context,
+        reply_to_message_id="m42",
+        raw_message=SimpleNamespace(reference=SimpleNamespace(channel_id="ch123")),
+    )
+
+    response = asyncio.run(runner._handle_message(event))
+
+    assert response == "ok"
+    assert captured["message"] == (
+        f"{extra_context}\n\n"
+        '**Replying to Hermes-Bot**: "2 plus 2 equals 4"\n'
+        "**Current user**: giftedgummybee\n"
+        "**Request**: what is 3+4?"
+    )
+
+
+def test_handle_message_applies_delivery_state_reply_target(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+
+    async def _fake_run_agent(*, message, delivery_state, **kwargs):
+        delivery_state["reply_to"] = "m999"
+        return {
+            "final_response": "ok",
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "ok"},
+            ],
+            "history_input_len": 0,
+            "tools": [],
+        }
+
+    runner._run_agent = _fake_run_agent
+
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m111",
+    )
+
+    response = asyncio.run(runner._handle_message(event))
+
+    assert response == "ok"
+    assert getattr(event, "_response_reply_to_message_id") == "m999"
+
+
+def test_handle_message_records_parent_handoff_when_thread_resume_is_deferred(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    class _FakeDiscordAdapter:
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SimpleNamespace(success=True)
+
+    runner.adapters[Platform.DISCORD] = _FakeDiscordAdapter()
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+    thread_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="th789",
+        chat_name="deep-dive",
+        chat_type="thread",
+        user_id="u123",
+        user_name="giftedgummybee",
+        thread_id="th789",
+    )
+
+    async def _fake_run_agent(*, message, delivery_state, **kwargs):
+        delivery_state.update(
+            {
+                "chat_id": "th789",
+                "reply_to": None,
+                "thread_result": {
+                    "thread_id": "th789",
+                    "thread_mention": "<#th789>",
+                    "thread_name": "deep-dive",
+                },
+                "thread_source": thread_source,
+                "thread_session_id": "session-thread",
+                "thread_session_key": "agent:main:discord:thread:th789",
+                "transcript_notice": "[Continued in thread <#th789>]",
+                "main_notice": "Taking this to a thread: <#th789>",
+            }
+        )
+        return {
+            "final_response": "",
+            "messages": [
+                {"role": "user", "content": message},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_a",
+                            "type": "function",
+                            "function": {"name": "fork_thread", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_a",
+                    "content": json.dumps(
+                        {
+                            "success": True,
+                            "requested": True,
+                            "thread_id": "th789",
+                            "thread_mention": "<#th789>",
+                            "title": "deep-dive",
+                        }
+                    ),
+                },
+            ],
+            "history_input_len": 0,
+            "tools": [],
+            "deferred_pending_event": True,
+        }
+
+    runner._run_agent = _fake_run_agent
+
+    event = MessageEvent(
+        text="Can you go deeper?",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m123",
+    )
+
+    response = asyncio.run(runner._handle_message(event))
+
+    assert response == ""
+    assert getattr(event, "_response_handled") is True
+
+    session_entry = runner.session_store.get_or_create_session(source)
+    history = runner.session_store.load_transcript(session_entry.session_id)
+    assert any(
+        msg.get("role") == "assistant"
+        and msg.get("content") == "[Continued in thread <#th789>]"
+        for msg in history
+    )
 
 
 def test_set_session_env_tracks_live_discord_fork_availability(tmp_path):
@@ -495,6 +707,137 @@ def test_run_agent_accepts_multimodal_message_without_scope_error(tmp_path):
     assert result["final_response"] == "ok"
 
 
+def test_run_agent_cross_user_interrupt_rebuilds_pending_discord_turn(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._session_db = None
+
+    source_a = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+    source_b = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u456",
+        user_name="neggles",
+    )
+
+    pending_event = MessageEvent(
+        text="@Hermes-Bot what is 1+1",
+        message_type=MessageType.TEXT,
+        source=source_b,
+        message_id="m222",
+        extra_context="[Discord context]\n00:11 giftedgummybee: previous message",
+        reply_to_message_id="m_bot",
+        raw_message=SimpleNamespace(reference=SimpleNamespace(channel_id="ch123")),
+    )
+
+    class _FakeDiscordAdapter:
+        def __init__(self):
+            self.is_connected = True
+            self._active_sessions = {"ch123": asyncio.Event()}
+            self._archive_db = SimpleNamespace(
+                get_reply_context=lambda **kwargs: {
+                    "author_display": "Hermes-Bot",
+                    "preview": "previous partial answer from Hermes",
+                }
+            )
+            self._pending = [pending_event]
+
+        def get_pending_message(self, chat_id):
+            if self._pending:
+                return self._pending.pop(0)
+            return None
+
+    runner.adapters[Platform.DISCORD] = _FakeDiscordAdapter()
+
+    observed_user_messages = []
+    observed_histories = []
+
+    class FakeAIAgent:
+        call_count = 0
+
+        def __init__(self, **kwargs):
+            self.tools = []
+
+        def run_conversation(self, user_message, conversation_history=None, task_id=None):
+            FakeAIAgent.call_count += 1
+            observed_user_messages.append(user_message)
+            observed_histories.append(list(conversation_history or []))
+            if FakeAIAgent.call_count == 1:
+                return {
+                    "final_response": "Operation interrupted.",
+                    "messages": [
+                        {"role": "assistant", "content": "stable history"},
+                        {"role": "user", "content": "first question"},
+                        {"role": "assistant", "content": "partial reply"},
+                    ],
+                    "api_calls": 1,
+                    "interrupted": True,
+                }
+            return {
+                "final_response": "2",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": "2"},
+                ],
+                "api_calls": 1,
+                "interrupted": False,
+            }
+
+    delivery_state = runner._new_delivery_state(
+        source_a,
+        MessageEvent(
+            text="first question",
+            message_type=MessageType.TEXT,
+            source=source_a,
+            message_id="m111",
+        ),
+    )
+
+    with patch("run_agent.AIAgent", FakeAIAgent):
+        result = asyncio.run(
+            runner._run_agent(
+                message="first question",
+                context_prompt="",
+                history=[{"role": "assistant", "content": "stable history"}],
+                source=source_a,
+                session_id="session-1",
+                session_key="agent:main:discord:group:ch123",
+                event=MessageEvent(
+                    text="first question",
+                    message_type=MessageType.TEXT,
+                    source=source_a,
+                    message_id="m111",
+                ),
+                delivery_state=delivery_state,
+            )
+        )
+
+    assert result["final_response"] == "2"
+    assert observed_user_messages[0] == "first question"
+    resumed_payload = observed_user_messages[1]
+    assert "interrupted by a new message from neggles" in resumed_payload
+    assert "[Discord context]" in resumed_payload
+    assert '**Replying to Hermes-Bot**: "previous partial answer from Hermes"' in resumed_payload
+    assert "**Current user**: neggles" in resumed_payload
+    assert "**Request**: @Hermes-Bot what is 1+1" in resumed_payload
+    assert observed_histories[1] == [{"role": "assistant", "content": "stable history"}]
+    assert delivery_state["reply_to"] == "m222"
+
+
 def test_extract_fork_thread_request_uses_latest_successful_tool_result(tmp_path):
     runner = GatewayRunner(
         GatewayConfig(sessions_dir=tmp_path / "sessions")
@@ -528,6 +871,116 @@ def test_extract_fork_thread_request_uses_latest_successful_tool_result(tmp_path
     request = runner._extract_fork_thread_request(messages)
 
     assert request == {"title": "deep-dive", "visibility": "private", "reason": ""}
+
+
+def test_run_agent_interrupt_in_live_fork_thread_defers_to_thread_session(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+    thread_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="th789",
+        chat_name="deep-dive",
+        chat_type="thread",
+        user_id="u123",
+        user_name="giftedgummybee",
+        thread_id="th789",
+    )
+    pending_event = MessageEvent(
+        text="actualy no look up current LITE prices",
+        message_type=MessageType.TEXT,
+        source=thread_source,
+        message_id="m333",
+        extra_context="[Thread seed | fork:public]\n09/03/2026 11\n16:45 <giftedgummybee>: @Hermes-Bot actualy no look up current LITE prices",
+    )
+
+    class _FakeDiscordAdapter:
+        def __init__(self):
+            self.is_connected = True
+            self._active_sessions = {"ch123": asyncio.Event(), "th789": asyncio.Event()}
+            self._pending_messages = {"th789": pending_event}
+
+        def get_pending_message(self, chat_id):
+            return self._pending_messages.pop(chat_id, None)
+
+    runner.adapters[Platform.DISCORD] = _FakeDiscordAdapter()
+
+    observed_user_messages = []
+
+    class FakeAIAgent:
+        call_count = 0
+
+        def __init__(self, **kwargs):
+            self.tools = []
+
+        def run_conversation(self, user_message, conversation_history=None, task_id=None):
+            FakeAIAgent.call_count += 1
+            observed_user_messages.append(user_message)
+            return {
+                "final_response": "Operation interrupted.",
+                "messages": [
+                    {"role": "assistant", "content": "stable history"},
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "partial reply"},
+                ],
+                "api_calls": 1,
+                "interrupted": True,
+            }
+
+    delivery_state = runner._new_delivery_state(
+        source,
+        MessageEvent(
+            text="first question",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="m111",
+        ),
+    )
+    delivery_state.update(
+        {
+            "chat_id": "th789",
+            "reply_to": None,
+            "thread_result": {"thread_id": "th789", "thread_mention": "<#th789>"},
+            "thread_source": thread_source,
+            "thread_session_id": "session-thread",
+            "thread_session_key": "agent:main:discord:thread:th789",
+            "transcript_notice": "[Continued in thread <#th789>]",
+        }
+    )
+
+    with patch("run_agent.AIAgent", FakeAIAgent):
+        result = asyncio.run(
+            runner._run_agent(
+                message="first question",
+                context_prompt="",
+                history=[{"role": "assistant", "content": "stable history"}],
+                source=source,
+                session_id="session-parent",
+                session_key="agent:main:discord:group:ch123",
+                event=MessageEvent(
+                    text="first question",
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id="m111",
+                ),
+                delivery_state=delivery_state,
+            )
+        )
+
+    assert result["final_response"] == ""
+    assert result["deferred_pending_event"] is True
+    assert FakeAIAgent.call_count == 1
+    assert observed_user_messages == ["first question"]
+    assert runner.adapters[Platform.DISCORD]._pending_messages["th789"] is pending_event
 
 
 def test_handle_message_collapses_trailing_main_channel_fork_handoff_history(tmp_path):
@@ -821,3 +1274,73 @@ def test_activate_live_fork_thread_switches_delivery_target_immediately(tmp_path
     assert runner.adapters[Platform.DISCORD]._active_sessions["th789"] is active_event
     assert sent == [("ch123", "Taking this to a thread: <#th789>", "m123")]
     assert "<#th789>" in result["parent_session_note"]
+
+    thread_history = runner.session_store.load_transcript(delivery_state["thread_session_id"])
+    assert thread_history[0]["role"] == "session_meta"
+    assert thread_history[1]["role"] == "user"
+    assert thread_history[1]["content"] == (
+        "[Forked from Test place / #bot-channel] Can you go deeper?"
+    )
+
+
+def test_append_thread_fork_transcript_is_idempotent_after_live_seed(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    original_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="ch123",
+        chat_name="Test place / #bot-channel",
+        chat_type="group",
+        user_id="u123",
+        user_name="giftedgummybee",
+    )
+    thread_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="th789",
+        chat_name="deep-dive",
+        chat_type="thread",
+        user_id="u123",
+        user_name="giftedgummybee",
+        thread_id="th789",
+    )
+
+    runner._ensure_thread_fork_transcript_seeded(
+        thread_source=thread_source,
+        original_source=original_source,
+        request_text="Can you go deeper?",
+        tool_defs=[],
+    )
+    runner._append_thread_fork_transcript(
+        thread_source=thread_source,
+        original_source=original_source,
+        request_text="Can you go deeper?",
+        response="Long answer for the thread",
+        tool_defs=[],
+    )
+    runner._append_thread_fork_transcript(
+        thread_source=thread_source,
+        original_source=original_source,
+        request_text="Can you go deeper?",
+        response="Long answer for the thread",
+        tool_defs=[],
+    )
+
+    thread_entry = runner.session_store.get_or_create_session(thread_source)
+    thread_history = runner.session_store.load_transcript(thread_entry.session_id)
+    assistant_messages = [
+        msg.get("content")
+        for msg in thread_history
+        if msg.get("role") == "assistant"
+    ]
+    user_messages = [
+        msg.get("content")
+        for msg in thread_history
+        if msg.get("role") == "user"
+    ]
+
+    assert assistant_messages == ["Long answer for the thread"]
+    assert user_messages == [
+        "[Forked from Test place / #bot-channel] Can you go deeper?"
+    ]

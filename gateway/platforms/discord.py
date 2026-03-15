@@ -408,6 +408,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
+            reference = None
+            if reply_to:
+                try:
+                    reference = await channel.fetch_message(int(reply_to))
+                except Exception as e:
+                    logger.debug("Could not fetch voice reply-to message: %s", e)
             
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
@@ -420,6 +426,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 msg = await channel.send(
                     content=caption if caption else None,
                     file=file,
+                    reference=reference,
                 )
                 return SendResult(success=True, message_id=str(msg.id))
         
@@ -446,6 +453,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
+            reference = None
+            if reply_to:
+                try:
+                    reference = await channel.fetch_message(int(reply_to))
+                except Exception as e:
+                    logger.debug("Could not fetch image reply-to message: %s", e)
             
             # Download the image and send as a Discord file attachment
             # (Discord renders attachments inline, unlike plain URLs)
@@ -472,6 +485,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     msg = await channel.send(
                         content=caption if caption else None,
                         file=file,
+                        reference=reference,
                     )
                     return SendResult(success=True, message_id=str(msg.id))
         
@@ -1196,31 +1210,117 @@ class DiscordAdapter(BasePlatformAdapter):
         if embed is None:
             return ""
 
-        parts: List[str] = []
-        for attr in ("title", "description", "url"):
-            value = cls._clean_text_block(getattr(embed, attr, ""))
-            if value:
-                parts.append(value)
-
+        provider_obj = getattr(embed, "provider", None)
+        provider_name = cls._clean_text_block(getattr(provider_obj, "name", "")) if provider_obj else ""
         author_obj = getattr(embed, "author", None)
         author_name = cls._clean_text_block(getattr(author_obj, "name", "")) if author_obj else ""
-        if author_name:
-            parts.append(author_name)
+        footer_obj = getattr(embed, "footer", None)
+        footer_text = cls._clean_text_block(getattr(footer_obj, "text", "")) if footer_obj else ""
+
+        provider_label = provider_name or footer_text
+        parts: List[str] = []
+        seen: Set[str] = set()
+
+        def _append_unique(value: Any) -> None:
+            cleaned = cls._clean_text_block(value)
+            if not cleaned:
+                return
+            key = cleaned.casefold()
+            if key in seen:
+                return
+            seen.add(key)
+            parts.append(cleaned)
+
+        if provider_label or author_name:
+            _append_unique(" | ".join(part for part in (provider_label, author_name) if part))
+
+        for attr in ("title", "description"):
+            _append_unique(getattr(embed, attr, ""))
 
         for field in getattr(embed, "fields", []) or []:
             name = cls._clean_text_block(getattr(field, "name", ""))
             value = cls._clean_text_block(getattr(field, "value", ""))
             if name and value:
-                parts.append(f"{name}: {value}")
-            elif value:
-                parts.append(value)
+                _append_unique(f"{name}: {value}")
+            else:
+                _append_unique(value)
 
-        footer_obj = getattr(embed, "footer", None)
-        footer_text = cls._clean_text_block(getattr(footer_obj, "text", "")) if footer_obj else ""
-        if footer_text:
-            parts.append(footer_text)
+        if footer_text and footer_text.casefold() != provider_label.casefold():
+            _append_unique(footer_text)
 
         return "\n".join(parts).strip()
+
+    @classmethod
+    def _render_embed_chunks(cls, base_text: str, embeds: List[Any]) -> List[str]:
+        embed_bodies = [body for body in (cls._embed_text(embed) for embed in embeds or []) if body]
+        if not embed_bodies:
+            return [base_text] if base_text else []
+
+        chunks: List[str] = []
+        if base_text:
+            chunks.append(f"{base_text} [embed]\n{embed_bodies[0]}\n[/embed]")
+            embed_bodies = embed_bodies[1:]
+
+        for body in embed_bodies:
+            chunks.append(f"[embed]\n{body}\n[/embed]")
+
+        return chunks
+
+    def _bot_mention_candidates(self) -> Set[str]:
+        if not self._client or not getattr(self._client, "user", None):
+            return set()
+
+        bot_user = self._client.user
+        candidates: Set[str] = set()
+        bot_id = str(getattr(bot_user, "id", "") or "").strip()
+        if bot_id:
+            candidates.add(f"<@{bot_id}>")
+            candidates.add(f"<@!{bot_id}>")
+
+        for raw_name in (
+            getattr(bot_user, "name", None),
+            getattr(bot_user, "global_name", None),
+            getattr(bot_user, "display_name", None),
+        ):
+            name = str(raw_name or "").strip()
+            if name:
+                candidates.add(f"@{name}")
+
+        return candidates
+
+    def _strip_leading_bot_mention(self, text: str) -> str:
+        cleaned = self._clean_text_block(text)
+        if not cleaned:
+            return ""
+
+        candidates = sorted(self._bot_mention_candidates(), key=len, reverse=True)
+        while cleaned:
+            matched = next((candidate for candidate in candidates if cleaned.startswith(candidate)), None)
+            if not matched:
+                break
+            cleaned = cleaned[len(matched):].lstrip(" \t\n,:-")
+        return cleaned
+
+    def _is_redundant_system_text(
+        self,
+        system_text: str,
+        *,
+        main_text: str,
+        raw_text: str,
+    ) -> bool:
+        cleaned_system = self._clean_text_block(system_text)
+        if not cleaned_system:
+            return False
+
+        cleaned_main = self._clean_text_block(main_text)
+        cleaned_raw = self._clean_text_block(raw_text)
+        if cleaned_system == cleaned_main or cleaned_system == cleaned_raw:
+            return True
+
+        stripped_system = self._strip_leading_bot_mention(cleaned_system)
+        if not stripped_system:
+            return False
+        return stripped_system == cleaned_main or stripped_system == self._strip_leading_bot_mention(cleaned_raw)
 
     def _materialize_message_text(self, message: DiscordMessage, base_content: Optional[str] = None) -> str:
         """
@@ -1236,31 +1336,29 @@ class DiscordAdapter(BasePlatformAdapter):
             main_content = getattr(message, "content", "") or ""
         main_content = self._replace_user_mentions(main_content, message)
         main_text = self._clean_text_block(main_content)
-        if main_text:
-            chunks.append(main_text)
+        raw_text = self._clean_text_block(
+            self._replace_user_mentions(getattr(message, "content", "") or "", message)
+        )
+        chunks.extend(self._render_embed_chunks(main_text, getattr(message, "embeds", []) or []))
 
         system_text = self._clean_text_block(
             self._replace_user_mentions(getattr(message, "system_content", "") or "", message)
         )
-        if system_text:
+        if system_text and not self._is_redundant_system_text(
+            system_text,
+            main_text=main_text,
+            raw_text=raw_text,
+        ):
             chunks.append(system_text)
 
-        for embed in getattr(message, "embeds", []) or []:
-            embed_text = self._embed_text(embed)
-            if embed_text:
-                chunks.append(embed_text)
-
         for snapshot in getattr(message, "message_snapshots", []) or []:
-            snapshot_chunks: List[str] = []
             snapshot_content = self._clean_text_block(
                 self._replace_user_mentions(getattr(snapshot, "content", "") or "", message)
             )
-            if snapshot_content:
-                snapshot_chunks.append(snapshot_content)
-            for embed in getattr(snapshot, "embeds", []) or []:
-                embed_text = self._embed_text(embed)
-                if embed_text:
-                    snapshot_chunks.append(embed_text)
+            snapshot_chunks = self._render_embed_chunks(
+                snapshot_content,
+                getattr(snapshot, "embeds", []) or [],
+            )
             if snapshot_chunks:
                 chunks.append("[forwarded message]\n" + "\n".join(snapshot_chunks))
 
@@ -1658,32 +1756,16 @@ class DiscordAdapter(BasePlatformAdapter):
         immediately followed by the real user question.
         """
         normalized = " ".join((content or "").split()).strip()
-        if not normalized or not self._client or not getattr(self._client, "user", None):
+        if not normalized:
             return False
 
-        bot_user = self._client.user
-        candidates: Set[str] = set()
-
-        bot_id = str(getattr(bot_user, "id", "")).strip()
-        if bot_id:
-            candidates.add(f"<@{bot_id}>")
-            candidates.add(f"<@!{bot_id}>")
-
-        for raw_name in (
-            getattr(bot_user, "name", None),
-            getattr(bot_user, "global_name", None),
-            getattr(bot_user, "display_name", None),
-        ):
-            name = str(raw_name or "").strip()
-            if name:
-                candidates.add(f"@{name}")
-
-        return normalized in candidates
+        return normalized in self._bot_mention_candidates()
 
     def _message_to_archive_row(self, message: DiscordMessage) -> Dict[str, Any]:
         channel = message.channel
         guild = getattr(channel, "guild", None)
         author = message.author
+        reference = getattr(message, "reference", None)
         created_at = (
             float(message.created_at.timestamp())
             if getattr(message, "created_at", None) is not None
@@ -1712,6 +1794,9 @@ class DiscordAdapter(BasePlatformAdapter):
             "content": normalized_content,
             "attachments_json": [self._attachment_payload(att) for att in (message.attachments or [])],
             "reactions_json": self._message_reaction_summary(message),
+            "reply_to_message_id": str(getattr(reference, "message_id", "") or "").strip() or None,
+            "reply_to_channel_id": str(getattr(reference, "channel_id", "") or "").strip() or None,
+            "reply_to_guild_id": str(getattr(reference, "guild_id", "") or "").strip() or None,
             "created_at": created_at,
             "edited_at": edited_at,
             "deleted": False,
@@ -2536,6 +2621,20 @@ class DiscordAdapter(BasePlatformAdapter):
         return f" [reactions: {', '.join(rendered)}]"
 
     @staticmethod
+    def _format_reply_suffix(msg: Dict[str, Any]) -> str:
+        reply_id = str(msg.get("reply_to_message_id") or "").strip()
+        if not reply_id:
+            return ""
+
+        reply_author = str(msg.get("reply_author_display") or "").strip()
+        reply_preview = " ".join((msg.get("reply_preview") or "").split()).strip()
+        if reply_author and reply_preview:
+            return f" (replying <{reply_author}>: {reply_preview})"
+        if reply_author:
+            return f" (replying <{reply_author}>)"
+        return f" (reply {reply_id})"
+
+    @staticmethod
     def _format_archive_history_line(msg: Dict[str, Any]) -> Tuple[str, str]:
         """
         Format one archived message as:
@@ -2547,11 +2646,20 @@ class DiscordAdapter(BasePlatformAdapter):
         hour_header = dt.strftime("%d/%m/%Y %H")
         minute_second = dt.strftime("%M:%S")
         author = msg.get("author_display") or msg.get("author_name") or msg.get("author_id") or "unknown"
-        content = " ".join((msg.get("content") or "").split())
+        content = DiscordAdapter._clean_text_block(msg.get("content") or "")
         if not content:
             content = "[non-text message]"
-        content += DiscordAdapter._format_reaction_suffix(msg)
-        return hour_header, f"{minute_second} <{author}>: {content}"
+        reaction_suffix = DiscordAdapter._format_reaction_suffix(msg)
+        reply_suffix = DiscordAdapter._format_reply_suffix(msg)
+        prefix = f"{minute_second} <{author}>{reply_suffix}: "
+        if "\n" not in content:
+            return hour_header, f"{prefix}{content}{reaction_suffix}"
+
+        first_line, *rest = content.split("\n")
+        rendered = f"{prefix}{first_line}{reaction_suffix}"
+        if rest:
+            rendered += "\n" + "\n".join(rest)
+        return hour_header, rendered
 
     @staticmethod
     def _format_archive_change_line(change: Dict[str, Any]) -> Tuple[str, str]:
@@ -2790,12 +2898,25 @@ class DiscordAdapter(BasePlatformAdapter):
             for row in rows
             if not self._is_bot_mention_only_content(str(row.get("content") or ""))
         ]
+        if thread_seed_prefix:
+            current_message_id = str(getattr(message, "id", "") or "").strip()
+            if current_message_id:
+                rows = [
+                    row
+                    for row in rows
+                    if str(row.get("message_id") or "").strip() != current_message_id
+                ]
 
         if (not anchor or force_auto_reset or force_fresh_window) and rows:
             try:
                 rows = await self._hydrate_context_reaction_rows(message.channel, rows)
             except Exception as e:
                 logger.debug("Discord reaction hydration for context failed: %s", e)
+        if rows and hasattr(self._archive_db, "enrich_reply_context_rows"):
+            try:
+                rows = self._archive_db.enrich_reply_context_rows(rows)
+            except Exception as e:
+                logger.debug("Discord reply enrichment for context failed: %s", e)
 
         change_rows: List[Dict[str, Any]] = []
         if anchor and hasattr(self._archive_db, "list_all_changes_since_anchor"):

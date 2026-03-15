@@ -1,5 +1,7 @@
 """Tests for gateway/discord_archive.py."""
 
+import sqlite3
+
 from gateway.discord_archive import DiscordArchiveDB
 from gateway.platforms.discord import DiscordAdapter
 
@@ -155,6 +157,48 @@ def test_mark_deleted_records_single_delete_change(tmp_path):
         db.close()
 
 
+def test_init_schema_adds_reply_columns_to_existing_messages_table(tmp_path):
+    db_path = tmp_path / "discord_data.sqlite"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE messages (
+                message_id TEXT PRIMARY KEY,
+                guild_id TEXT,
+                guild_name TEXT,
+                channel_id TEXT NOT NULL,
+                channel_name TEXT,
+                thread_id TEXT,
+                author_id TEXT,
+                author_name TEXT,
+                author_display TEXT,
+                author_is_bot INTEGER NOT NULL DEFAULT 0,
+                content TEXT,
+                attachments_json TEXT,
+                created_at REAL NOT NULL,
+                edited_at REAL,
+                deleted INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db = DiscordArchiveDB(db_path)
+    try:
+        columns = {
+            str(row["name"])
+            for row in db._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        assert "reply_to_message_id" in columns
+        assert "reply_to_channel_id" in columns
+        assert "reply_to_guild_id" in columns
+    finally:
+        db.close()
+
+
 def test_upsert_message_round_trips_reactions(tmp_path):
     db = DiscordArchiveDB(tmp_path / "discord_data.sqlite")
     try:
@@ -193,6 +237,68 @@ def test_upsert_message_round_trips_reactions(tmp_path):
             {"user_id": "u2", "user_name": "bob"},
             {"user_id": "u3", "user_name": "john"},
         ]
+    finally:
+        db.close()
+
+
+def test_upsert_message_round_trips_reply_metadata(tmp_path):
+    db = DiscordArchiveDB(tmp_path / "discord_data.sqlite")
+    try:
+        db.upsert_message(
+            {
+                "message_id": "101",
+                "channel_id": "ch1",
+                "guild_id": "g1",
+                "author_id": "u1",
+                "author_name": "alice",
+                "author_display": "alice",
+                "created_at": 1010.0,
+                "content": "replying now",
+                "reply_to_message_id": "100",
+                "reply_to_channel_id": "ch0",
+                "reply_to_guild_id": "g0",
+                "deleted": False,
+            }
+        )
+
+        row = db.get_message("ch1", "101")
+        assert row is not None
+        assert row["reply_to_message_id"] == "100"
+        assert row["reply_to_channel_id"] == "ch0"
+        assert row["reply_to_guild_id"] == "g0"
+    finally:
+        db.close()
+
+
+def test_enrich_reply_context_rows_resolves_parent_author_and_preview(tmp_path):
+    db = DiscordArchiveDB(tmp_path / "discord_data.sqlite")
+    try:
+        db.upsert_message(
+            {
+                "message_id": "100",
+                "channel_id": "ch1",
+                "guild_id": "g1",
+                "author_id": "u1",
+                "author_name": "alice",
+                "author_display": "alice",
+                "created_at": 1000.0,
+                "content": "01234567890123456789extra words",
+                "deleted": False,
+            }
+        )
+        rows = db.enrich_reply_context_rows(
+            [
+                {
+                    "message_id": "101",
+                    "channel_id": "ch1",
+                    "author_display": "bob",
+                    "content": "child message",
+                    "reply_to_message_id": "100",
+                }
+            ]
+        )
+        assert rows[0]["reply_author_display"] == "alice"
+        assert rows[0]["reply_preview"] == "01234567890123456789"
     finally:
         db.close()
 
@@ -328,6 +434,23 @@ def test_format_archive_history_line_caps_reactor_names():
         }
     )
     assert line.endswith("hello [reactions: kek (amy, bob, john, +2)]")
+
+
+def test_format_archive_history_line_includes_reply_suffix():
+    _, line = DiscordAdapter._format_archive_history_line(
+        {
+            "created_at": 1000.0,
+            "author_display": "alice",
+            "content": "hello",
+            "reply_to_message_id": "99",
+            "reply_author_display": "bob",
+            "reply_preview": "01234567890123456789",
+            "reactions": [],
+        }
+    )
+    assert line.endswith(
+        "<alice> (replying <bob>: 01234567890123456789): hello"
+    )
 
 
 def test_format_archive_change_line_for_reaction_add():

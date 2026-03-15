@@ -622,6 +622,68 @@ class TestDiscordAdapterContextSettings:
         assert force_auto_reset is False
         assert reset_reason == ""
 
+    def test_thread_seed_context_omits_current_thread_message(self):
+        adapter = DiscordAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="fake-token",
+                extra={"fresh_context_limit": 20, "delta_reset_threshold": 50},
+            )
+        )
+
+        class FakeThread:
+            pass
+
+        class FakeArchiveDB:
+            def get_thread_seed(self, thread_id):
+                return {
+                    "seed_text": "09/03/2026 11\n16:32 <giftedgummybee>: earlier parent context",
+                    "seed_kind": "fork:public",
+                }
+
+            def get_turn_anchor(self, channel_id):
+                return None
+
+            def list_recent_messages(self, channel_id, limit=20, include_bots=False):
+                return [
+                    {
+                        "message_id": "m_current",
+                        "created_at": 1700000010,
+                        "author_name": "alice",
+                        "content": "current follow-up",
+                    }
+                ]
+
+            def set_turn_anchor(self, channel_id, message_id):
+                return None
+
+        adapter._archive_db = FakeArchiveDB()
+
+        async def _noop(_thread):
+            return None
+
+        channel = FakeThread()
+        channel.id = "th1"
+        channel.name = "deep-dive"
+        channel.guild = SimpleNamespace(name="Test place")
+
+        message = SimpleNamespace(
+            id="m_current",
+            channel=channel,
+        )
+
+        with patch("gateway.platforms.discord.discord.Thread", FakeThread):
+            with patch.object(adapter, "_ensure_thread_seed", _noop):
+                block, force_auto_reset, reset_reason = asyncio.run(
+                    adapter._build_recent_channel_context(message)
+                )
+
+        assert "[Thread seed | fork:public]" in block
+        assert "earlier parent context" in block
+        assert "current follow-up" not in block
+        assert force_auto_reset is False
+        assert reset_reason == ""
+
     def test_delta_context_uses_threshold_as_followup_limit(self):
         adapter = DiscordAdapter(
             PlatformConfig(
@@ -816,6 +878,25 @@ class TestDiscordAdapterContextSettings:
 
         assert hour_header == "01/03/2026 01"
         assert line == "23:45 <giftedgummybee>: hello world"
+
+    def test_context_line_format_preserves_embed_block_newlines(self):
+        content = (
+            "https://x.com/jukan05/status/2030831615648346340?s=46 [embed]\n"
+            "X | Jukan (@jukan05)\n"
+            "SK Hynix is paying ASML an additional 15-20% on top of the price "
+            "of its EUV tools in order to accelerate delivery.\n"
+            "[/embed]"
+        )
+        hour_header, line = DiscordAdapter._format_archive_history_line(
+            {
+                "created_at": datetime(2026, 3, 1, 1, 23, 45).timestamp(),
+                "author_display": "giftedgummybee",
+                "content": content,
+            }
+        )
+
+        assert hour_header == "01/03/2026 01"
+        assert line == f"23:45 <giftedgummybee>: {content}"
 
     def test_reset_channel_context_clears_anchor_and_header_state(self):
         adapter = DiscordAdapter(
@@ -1240,6 +1321,81 @@ class TestDiscordAdapterContextSettings:
         assert rendered.startswith("[forwarded message]")
         assert "Forwarded payload body" in rendered
 
+    def test_materialize_message_text_renders_embed_block_for_link_preview(self):
+        adapter = DiscordAdapter(
+            PlatformConfig(enabled=True, token="fake-token")
+        )
+        message = SimpleNamespace(
+            content="https://x.com/jukan05/status/2030831615648346340?s=46",
+            system_content="",
+            embeds=[
+                SimpleNamespace(
+                    title="",
+                    description=(
+                        "SK Hynix is paying ASML an additional 15-20% on top of the "
+                        "price of its EUV tools in order to accelerate delivery."
+                    ),
+                    fields=[],
+                    author=SimpleNamespace(name="Jukan (@jukan05)"),
+                    footer=SimpleNamespace(text="X"),
+                )
+            ],
+            message_snapshots=[],
+            mentions=[],
+        )
+
+        rendered = adapter._materialize_message_text(message)
+
+        assert rendered == (
+            "https://x.com/jukan05/status/2030831615648346340?s=46 [embed]\n"
+            "X | Jukan (@jukan05)\n"
+            "SK Hynix is paying ASML an additional 15-20% on top of the price "
+            "of its EUV tools in order to accelerate delivery.\n"
+            "[/embed]"
+        )
+        assert "twitter.com" not in rendered
+
+    def test_materialize_message_text_skips_redundant_system_echo_for_bot_mention(self):
+        adapter = DiscordAdapter(
+            PlatformConfig(enabled=True, token="fake-token")
+        )
+        adapter._client = SimpleNamespace(
+            user=SimpleNamespace(
+                id="999",
+                name="Hermes-Bot",
+                global_name=None,
+                display_name=None,
+            )
+        )
+        message = SimpleNamespace(
+            content="@Hermes-Bot what is 1+1 https://x.com/markflowchatter/status/2030819448878158188?s=20",
+            system_content="@Hermes-Bot what is 1+1 https://x.com/markflowchatter/status/2030819448878158188?s=20",
+            embeds=[
+                SimpleNamespace(
+                    title="",
+                    description="This will hurt Micron $MU even more tomorrow",
+                    fields=[],
+                    author=SimpleNamespace(name="Marc Lehman (@markflowchatter)"),
+                    footer=SimpleNamespace(text="X"),
+                )
+            ],
+            message_snapshots=[],
+            mentions=[],
+        )
+
+        rendered = adapter._materialize_message_text(
+            message,
+            base_content="what is 1+1 https://x.com/markflowchatter/status/2030819448878158188?s=20",
+        )
+
+        assert rendered == (
+            "what is 1+1 https://x.com/markflowchatter/status/2030819448878158188?s=20 [embed]\n"
+            "X | Marc Lehman (@markflowchatter)\n"
+            "This will hurt Micron $MU even more tomorrow\n"
+            "[/embed]"
+        )
+        assert "\n\n@Hermes-Bot what is 1+1" not in rendered
+
     def test_message_to_archive_row_includes_forward_snapshot_text(self):
         adapter = DiscordAdapter(
             PlatformConfig(enabled=True, token="fake-token")
@@ -1271,6 +1427,39 @@ class TestDiscordAdapterContextSettings:
 
         assert row["content"].startswith("[forwarded message]")
         assert "Forwarded text from another channel" in row["content"]
+
+    def test_message_to_archive_row_includes_reply_reference_metadata(self):
+        adapter = DiscordAdapter(
+            PlatformConfig(enabled=True, token="fake-token")
+        )
+        message = SimpleNamespace(
+            id="m1",
+            content="hello",
+            system_content="",
+            embeds=[],
+            message_snapshots=[],
+            mentions=[],
+            attachments=[],
+            channel=SimpleNamespace(
+                id="ch1",
+                name="general",
+                guild=SimpleNamespace(id="g1", name="Guild One"),
+            ),
+            author=SimpleNamespace(id="u1", name="alice", bot=False),
+            created_at=datetime.fromtimestamp(1700000000),
+            edited_at=None,
+            reference=SimpleNamespace(
+                message_id="m0",
+                channel_id="ch0",
+                guild_id="g0",
+            ),
+        )
+
+        row = adapter._message_to_archive_row(message)
+
+        assert row["reply_to_message_id"] == "m0"
+        assert row["reply_to_channel_id"] == "ch0"
+        assert row["reply_to_guild_id"] == "g0"
 
     def test_handle_message_uses_forward_snapshot_in_event_text(self):
         adapter = DiscordAdapter(
