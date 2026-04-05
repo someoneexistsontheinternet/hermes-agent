@@ -16,20 +16,24 @@ Usage:
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import mimetypes
 import os
 import re
+import shutil
 import sys
 import signal
+import subprocess
+import tempfile
 import threading
 import urllib.parse
 import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Tuple
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -124,6 +128,11 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 from model_runtime_config import load_model_runtime_config
 
 logger = logging.getLogger(__name__)
+
+MAX_MULTIMODAL_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_MULTIMODAL_IMAGE_SOURCE_BYTES = 20 * 1024 * 1024
+MAX_MULTIMODAL_IMAGE_DIMENSION = 1500
+MULTIMODAL_IMAGE_JPEG_QUALITIES = (85, 75, 65)
 
 
 def _has_context_files(path: Path) -> bool:
@@ -2302,11 +2311,12 @@ class GatewayRunner:
         value = (value or "").strip().lower()
         return value.startswith("data:image/")
 
-    def _normalize_data_image_url(self, value: str) -> str:
+    def _normalize_data_image_url(self, value: str) -> Optional[str]:
         """
-        Normalize `data:image/...;base64,...` URLs so declared MIME matches bytes.
+        Normalize `data:image/...;base64,...` URLs so MIME and size are provider-safe.
 
-        Returns the original value when parsing/decoding is not possible.
+        Returns None when parsing/decoding is not possible or the image cannot
+        be reduced below the provider size limit.
         """
         data_url = str(value or "").strip()
         if not self._is_data_image_url(data_url):
@@ -2315,33 +2325,24 @@ class GatewayRunner:
         try:
             header, encoded = data_url.split(",", 1)
         except ValueError:
-            return data_url
+            return None
 
         lower_header = header.lower()
         if ";base64" not in lower_header:
-            return data_url
+            return None
 
         declared_mime = lower_header[5:].split(";", 1)[0].strip()
         cleaned_encoded = re.sub(r"\s+", "", encoded)
         try:
             raw = base64.b64decode(cleaned_encoded, validate=True)
         except Exception:
-            return data_url
+            return None
 
-        resolved_mime = self._resolve_image_mime(
+        return self._image_bytes_to_data_url(
             raw=raw,
             declared_mime=declared_mime,
             name_hint="data-url",
         )
-        if not resolved_mime or resolved_mime == declared_mime:
-            return data_url
-
-        logger.debug(
-            "Normalized data URL image MIME mismatch: declared=%s, resolved=%s",
-            declared_mime,
-            resolved_mime,
-        )
-        return f"data:{resolved_mime};base64,{cleaned_encoded}"
 
     @staticmethod
     def _is_gif_media(path: str, media_type: str) -> bool:
@@ -2424,6 +2425,208 @@ class GatewayRunner:
                 return part.split("=", 1)[1].strip()
         return ""
 
+    @staticmethod
+    def _image_temp_suffix(name_hint: str, declared_mime: str) -> str:
+        parsed_name = urllib.parse.urlparse(str(name_hint or "")).path or str(name_hint or "")
+        suffix = Path(parsed_name).suffix
+        if suffix:
+            return suffix
+        guessed = mimetypes.guess_extension(str(declared_mime or "").split(";", 1)[0].strip().lower())
+        return guessed or ".img"
+
+    def _downscale_oversized_image_with_pillow(
+        self,
+        raw: bytes,
+        declared_mime: str,
+    ) -> Optional[bytes]:
+        try:
+            from PIL import Image, ImageOps  # type: ignore
+        except Exception:
+            return None
+
+        try:
+            with Image.open(io.BytesIO(raw)) as image:
+                image = ImageOps.exif_transpose(image)
+                resampling_enum = getattr(Image, "Resampling", Image)
+                resample = getattr(
+                    resampling_enum,
+                    "LANCZOS",
+                    getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", 1)),
+                )
+                image.thumbnail(
+                    (MAX_MULTIMODAL_IMAGE_DIMENSION, MAX_MULTIMODAL_IMAGE_DIMENSION),
+                    resample,
+                )
+
+                candidates: List[bytes] = []
+                if declared_mime == "image/png":
+                    png_buffer = io.BytesIO()
+                    image.save(png_buffer, format="PNG", optimize=True)
+                    candidates.append(png_buffer.getvalue())
+
+                rgba_image = image.convert("RGBA")
+                background = Image.new("RGB", rgba_image.size, (255, 255, 255))
+                background.paste(rgba_image, mask=rgba_image.getchannel("A"))
+                for quality in MULTIMODAL_IMAGE_JPEG_QUALITIES:
+                    jpeg_buffer = io.BytesIO()
+                    background.save(
+                        jpeg_buffer,
+                        format="JPEG",
+                        quality=quality,
+                        optimize=True,
+                    )
+                    candidates.append(jpeg_buffer.getvalue())
+
+                if not candidates:
+                    return None
+                return min(candidates, key=len)
+        except Exception as e:
+            logger.debug("Pillow resize failed for oversized image payload: %s", e)
+            return None
+
+    def _downscale_oversized_image_with_sips(
+        self,
+        raw: bytes,
+        declared_mime: str,
+        name_hint: str,
+    ) -> Optional[bytes]:
+        if sys.platform != "darwin":
+            return None
+
+        sips_bin = shutil.which("sips")
+        if not sips_bin:
+            return None
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="hermes-image-") as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                input_path = tmp_path / f"input{self._image_temp_suffix(name_hint, declared_mime)}"
+                input_path.write_bytes(raw)
+
+                best: Optional[bytes] = None
+                for quality in MULTIMODAL_IMAGE_JPEG_QUALITIES:
+                    output_path = tmp_path / f"output-{quality}.jpg"
+                    result = subprocess.run(
+                        [
+                            sips_bin,
+                            "-Z",
+                            str(MAX_MULTIMODAL_IMAGE_DIMENSION),
+                            "-s",
+                            "format",
+                            "jpeg",
+                            "-s",
+                            "formatOptions",
+                            str(quality),
+                            str(input_path),
+                            "--out",
+                            str(output_path),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=20,
+                    )
+                    if result.returncode != 0 or not output_path.exists():
+                        logger.debug(
+                            "sips resize failed for %s (quality=%s): %s",
+                            name_hint,
+                            quality,
+                            (result.stderr or result.stdout or "").strip(),
+                        )
+                        continue
+
+                    candidate = output_path.read_bytes()
+                    if not candidate:
+                        continue
+                    if best is None or len(candidate) < len(best):
+                        best = candidate
+                    if len(candidate) <= MAX_MULTIMODAL_IMAGE_BYTES:
+                        return candidate
+
+                return best
+        except Exception as e:
+            logger.debug("sips resize failed for oversized image payload %s: %s", name_hint, e)
+            return None
+
+    def _downscale_oversized_image(
+        self,
+        raw: bytes,
+        declared_mime: str,
+        name_hint: str,
+    ) -> Optional[bytes]:
+        resized = self._downscale_oversized_image_with_pillow(raw, declared_mime)
+        if resized:
+            return resized
+        return self._downscale_oversized_image_with_sips(raw, declared_mime, name_hint)
+
+    def _prepare_image_bytes_for_payload(
+        self,
+        raw: bytes,
+        declared_mime: str,
+        name_hint: str,
+    ) -> Optional[Tuple[bytes, str]]:
+        if not raw:
+            return None
+
+        mime_type = self._resolve_image_mime(
+            raw=raw,
+            declared_mime=declared_mime,
+            name_hint=name_hint,
+        )
+        payload_raw = raw
+        if len(payload_raw) > MAX_MULTIMODAL_IMAGE_BYTES:
+            logger.info(
+                "Resizing oversized image for multimodal payload: %s (%s bytes)",
+                name_hint,
+                len(payload_raw),
+            )
+            resized = self._downscale_oversized_image(
+                raw=payload_raw,
+                declared_mime=mime_type,
+                name_hint=name_hint,
+            )
+            if not resized:
+                logger.warning(
+                    "Skipping oversized image for multimodal payload; resize failed: %s (%s bytes)",
+                    name_hint,
+                    len(payload_raw),
+                )
+                return None
+            payload_raw = resized
+            mime_type = self._resolve_image_mime(
+                raw=payload_raw,
+                declared_mime=mime_type,
+                name_hint=name_hint,
+            )
+
+        if len(payload_raw) > MAX_MULTIMODAL_IMAGE_BYTES:
+            logger.warning(
+                "Skipping oversized image for multimodal payload after resize: %s (%s bytes)",
+                name_hint,
+                len(payload_raw),
+            )
+            return None
+
+        return payload_raw, mime_type
+
+    def _image_bytes_to_data_url(
+        self,
+        raw: bytes,
+        declared_mime: str,
+        name_hint: str,
+    ) -> Optional[str]:
+        prepared = self._prepare_image_bytes_for_payload(
+            raw=raw,
+            declared_mime=declared_mime,
+            name_hint=name_hint,
+        )
+        if not prepared:
+            return None
+
+        payload_raw, mime_type = prepared
+        encoded = base64.b64encode(payload_raw).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
     def _collect_multimodal_image_items(self, event: MessageEvent) -> List[Dict[str, str]]:
         """
         Collect image inputs from an event for direct multimodal payloads.
@@ -2502,17 +2705,15 @@ class GatewayRunner:
             logger.debug("Could not interpret image path for multimodal payload (%r): %s", path, e)
             return None
         try:
-            if p.stat().st_size > 8 * 1024 * 1024:
+            if p.stat().st_size > MAX_MULTIMODAL_IMAGE_SOURCE_BYTES:
                 logger.warning("Skipping oversized local image for multimodal payload: %s", p)
                 return None
             raw = p.read_bytes()
-            mime_type = self._resolve_image_mime(
+            return self._image_bytes_to_data_url(
                 raw=raw,
                 declared_mime=media_type,
                 name_hint=p.name,
             )
-            encoded = base64.b64encode(raw).decode("ascii")
-            return f"data:{mime_type};base64,{encoded}"
         except Exception as e:
             logger.debug("Could not convert local image to data URL (%s): %s", p, e)
             return None
@@ -2522,7 +2723,7 @@ class GatewayRunner:
         if not self._is_http_url(url):
             return None
         try:
-            max_bytes = 8 * 1024 * 1024
+            max_bytes = MAX_MULTIMODAL_IMAGE_SOURCE_BYTES
             req = urllib.request.Request(
                 url,
                 headers={
@@ -2537,13 +2738,11 @@ class GatewayRunner:
                     return None
                 header_mime = str(resp.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
             declared_mime = header_mime if header_mime.startswith("image/") else media_type
-            mime_type = self._resolve_image_mime(
+            return self._image_bytes_to_data_url(
                 raw=raw,
                 declared_mime=declared_mime,
                 name_hint=urllib.parse.urlparse(url).path,
             )
-            encoded = base64.b64encode(raw).decode("ascii")
-            return f"data:{mime_type};base64,{encoded}"
         except Exception as e:
             logger.debug("Could not convert remote image URL to data URL (%s): %s", url, e)
             return None
@@ -2555,9 +2754,15 @@ class GatewayRunner:
 
         # Normalize existing data URLs from history/inputs so MIME matches bytes.
         if self._is_data_image_url(source_url):
-            return self._normalize_data_image_url(source_url)
+            normalized = self._normalize_data_image_url(source_url)
+            if normalized:
+                return normalized
+            return None
         if self._is_data_image_url(path):
-            return self._normalize_data_image_url(path)
+            normalized = self._normalize_data_image_url(path)
+            if normalized:
+                return normalized
+            return None
 
         # Prefer local cached files so providers that reject remote URL sources
         # still receive a valid base64-encoded image payload.

@@ -533,6 +533,77 @@ def test_http_image_to_data_url_uses_sniffed_mime_on_header_mismatch(tmp_path):
     assert base64.b64decode(encoded) == png_bytes
 
 
+def test_multimodal_image_payload_resizes_oversized_local_image(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    oversized_png = b"\x89PNG\r\n\x1a\n" + (b"0" * ((5 * 1024 * 1024) + 128))
+    resized_jpeg = b"\xff\xd8\xff" + (b"1" * 1024)
+    local_image = tmp_path / "large.png"
+    local_image.write_bytes(oversized_png)
+
+    with patch.object(runner, "_downscale_oversized_image", return_value=resized_jpeg) as resize_mock:
+        payload_url = runner._resolve_image_payload_url(
+            {
+                "path": str(local_image),
+                "media_type": "image/png",
+                "source_url": "",
+            }
+        )
+
+    resize_mock.assert_called_once()
+    assert payload_url is not None
+    assert payload_url.startswith("data:image/jpeg;base64,")
+    encoded = payload_url.split(",", 1)[1]
+    assert base64.b64decode(encoded) == resized_jpeg
+
+
+def test_resolve_image_payload_url_resizes_oversized_data_url(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    oversized_png = b"\x89PNG\r\n\x1a\n" + (b"0" * ((5 * 1024 * 1024) + 256))
+    resized_jpeg = b"\xff\xd8\xff" + (b"2" * 2048)
+    oversized_data_url = "data:image/png;base64," + base64.b64encode(oversized_png).decode("ascii")
+
+    with patch.object(runner, "_downscale_oversized_image", return_value=resized_jpeg) as resize_mock:
+        payload_url = runner._resolve_image_payload_url(
+            {
+                "path": oversized_data_url,
+                "media_type": "image/png",
+                "source_url": "",
+            }
+        )
+
+    resize_mock.assert_called_once()
+    assert payload_url is not None
+    assert payload_url.startswith("data:image/jpeg;base64,")
+    encoded = payload_url.split(",", 1)[1]
+    assert base64.b64decode(encoded) == resized_jpeg
+
+
+def test_resolve_image_payload_url_omits_oversized_data_url_when_resize_fails(tmp_path):
+    runner = GatewayRunner(
+        GatewayConfig(sessions_dir=tmp_path / "sessions")
+    )
+
+    oversized_png = b"\x89PNG\r\n\x1a\n" + (b"0" * ((5 * 1024 * 1024) + 256))
+    oversized_data_url = "data:image/png;base64," + base64.b64encode(oversized_png).decode("ascii")
+
+    with patch.object(runner, "_downscale_oversized_image", return_value=None):
+        payload_url = runner._resolve_image_payload_url(
+            {
+                "path": oversized_data_url,
+                "media_type": "image/png",
+                "source_url": "",
+            }
+        )
+
+    assert payload_url is None
+
+
 def test_multimodal_image_payload_returns_none_when_no_data_url_possible(tmp_path):
     runner = GatewayRunner(
         GatewayConfig(sessions_dir=tmp_path / "sessions")
