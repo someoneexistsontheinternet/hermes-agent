@@ -1,0 +1,10 @@
+[
+  {
+    "role": "user",
+    "content": "Hi! How are you?"
+  },
+  {
+    "role": "assistant",
+    "content": "\n<REASONING_SCRATCHPAD>\nThe user is just greeting me casually.\n</REASONING_SCRATCHPAD>\n\nHi there! I'm doing well, thanks for asking! How are you doing today? Is there anything I can help you with?"
+  }
+]

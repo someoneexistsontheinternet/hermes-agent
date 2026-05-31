@@ -492,6 +492,8 @@ class TestSpawnEnvSanitization:
         assert "/data/data/com.termux/files/usr/tmp/hermes_bg_" in bg_command
         assert ".exit" in bg_command
         assert "rc=$?;" in bg_command
+        assert "\n( nohup bash -lc" in bg_command
+        assert " && " not in bg_command
         assert " > /tmp/hermes_bg_" not in bg_command
         assert "cat /tmp/hermes_bg_" not in bg_command
         fake_thread.start.assert_called_once()

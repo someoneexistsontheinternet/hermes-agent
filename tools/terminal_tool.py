@@ -944,6 +944,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - modal_sandbox_kwargs: dict -- Extra Modal sandbox kwargs
+        - container_persistent: bool -- Override snapshot persistence for this task
 
     Args:
         task_id: The rollout's unique task identifier
@@ -1165,6 +1167,9 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                     sandbox_kwargs["ephemeral_disk"] = disk
             except Exception:
                 pass
+        extra_modal_kwargs = cc.get("modal_sandbox_kwargs", {})
+        if extra_modal_kwargs:
+            sandbox_kwargs.update(extra_modal_kwargs)
 
         modal_state = _get_modal_backend_state(cc.get("modal_mode"))
 
@@ -1783,8 +1788,14 @@ def terminal_tool(
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
                                 "container_disk": config.get("container_disk", 51200),
-                                "container_persistent": config.get("container_persistent", True),
-                                "modal_mode": config.get("modal_mode", "auto"),
+                                "container_persistent": overrides.get(
+                                    "container_persistent",
+                                    config.get("container_persistent", True),
+                                ),
+                                "modal_mode": overrides.get(
+                                    "modal_mode",
+                                    config.get("modal_mode", "auto"),
+                                ),
                                 "vercel_runtime": config.get("vercel_runtime", ""),
                                 "docker_volumes": config.get("docker_volumes", []),
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
@@ -1792,6 +1803,8 @@ def terminal_tool(
                                 "docker_env": config.get("docker_env", {}),
                                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                             }
+                            if env_type == "modal" and overrides.get("modal_sandbox_kwargs"):
+                                container_config["modal_sandbox_kwargs"] = overrides["modal_sandbox_kwargs"]
 
                         local_config = None
                         if env_type == "local":

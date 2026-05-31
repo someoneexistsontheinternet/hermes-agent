@@ -610,10 +610,11 @@ class ProcessRegistry:
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
         bg_command = (
-            f"mkdir -p {quoted_temp_dir} && "
+            f"mkdir -p {quoted_temp_dir}\n"
             f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
-            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
-            f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
+            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) &\n"
+            f"echo $! > {quoted_pid_path}\n"
+            f"cat {quoted_pid_path}"
         )
 
         try:

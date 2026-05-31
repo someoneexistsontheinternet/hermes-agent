@@ -385,13 +385,22 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
                     "container_disk": config.get("container_disk", 51200),
-                    "container_persistent": config.get("container_persistent", True),
+                    "container_persistent": overrides.get(
+                        "container_persistent",
+                        config.get("container_persistent", True),
+                    ),
+                    "modal_mode": overrides.get(
+                        "modal_mode",
+                        config.get("modal_mode", "auto"),
+                    ),
                     "vercel_runtime": config.get("vercel_runtime", ""),
                     "docker_volumes": config.get("docker_volumes", []),
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                     "docker_forward_env": config.get("docker_forward_env", []),
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 }
+                if env_type == "modal" and overrides.get("modal_sandbox_kwargs"):
+                    container_config["modal_sandbox_kwargs"] = overrides["modal_sandbox_kwargs"]
 
             ssh_config = None
             if env_type == "ssh":

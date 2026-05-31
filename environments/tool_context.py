@@ -79,13 +79,24 @@ class ToolContext:
     # Terminal tools
     # -------------------------------------------------------------------------
 
-    def terminal(self, command: str, timeout: int = 180) -> Dict[str, Any]:
+    def terminal(
+        self,
+        command: str,
+        timeout: int = 180,
+        *,
+        background: bool = False,
+        notify_on_complete: bool = False,
+        watch_patterns: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """
         Run a command in the rollout's terminal session.
 
         Args:
             command: Shell command to execute
             timeout: Command timeout in seconds
+            background: Start a tracked background process
+            notify_on_complete: Request a completion notification for background commands
+            watch_patterns: Optional output patterns for background command notifications
 
         Returns:
             Dict with 'exit_code' (int) and 'output' (str)
@@ -94,10 +105,18 @@ class ToolContext:
         backend = os.getenv("TERMINAL_ENV", "local")
         logger.debug("ToolContext.terminal [%s backend] task=%s: %s", backend, self.task_id[:8], command[:100])
 
+        arguments: Dict[str, Any] = {"command": command, "timeout": timeout}
+        if background:
+            arguments["background"] = True
+        if notify_on_complete:
+            arguments["notify_on_complete"] = True
+        if watch_patterns is not None:
+            arguments["watch_patterns"] = watch_patterns
+
         # Run via thread helper so modal/docker/daytona backends' asyncio.run() doesn't deadlock
         result = _run_tool_in_thread(
             "terminal",
-            {"command": command, "timeout": timeout},
+            arguments,
             self.task_id,
         )
         try:

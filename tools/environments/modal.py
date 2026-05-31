@@ -119,29 +119,69 @@ class _AsyncWorker:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._started = threading.Event()
+        self._startup_error: BaseException | None = None
 
     def start(self):
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        self._started.wait(timeout=30)
+        if not self._started.wait(timeout=30):
+            raise TimeoutError("AsyncWorker failed to signal startup")
+        if self._startup_error is not None:
+            self.stop()
+            raise RuntimeError("AsyncWorker failed to start") from self._startup_error
+        if self._loop is None or self._loop.is_closed():
+            raise RuntimeError("AsyncWorker loop did not initialize")
 
     def _run_loop(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
+        loop: asyncio.AbstractEventLoop | None = None
+        try:
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
+        except BaseException as exc:
+            self._startup_error = exc
+            self._started.set()
+            return
+
         self._started.set()
-        self._loop.run_forever()
+        try:
+            loop.run_forever()
+        finally:
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                shutdown_default_executor = getattr(loop, "shutdown_default_executor", None)
+                if shutdown_default_executor is not None:
+                    loop.run_until_complete(shutdown_default_executor())
+            except Exception:
+                logger.debug("Error shutting down AsyncWorker loop", exc_info=True)
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+                self._loop = None
 
     def run_coroutine(self, coro, timeout=600):
         if self._loop is None or self._loop.is_closed():
             raise RuntimeError("AsyncWorker loop is not running")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except Exception:
+            future.cancel()
+            raise
 
     def stop(self):
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread:
-            self._thread.join(timeout=10)
+        loop = self._loop
+        thread = self._thread
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread and thread.is_alive():
+            thread.join(timeout=10)
+        self._thread = None
 
 
 class ModalEnvironment(BaseEnvironment):

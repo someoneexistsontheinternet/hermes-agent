@@ -16,9 +16,10 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from model_tools import handle_function_call
 from tools.terminal_tool import get_active_env
@@ -47,6 +48,38 @@ def resize_tool_pool(max_workers: int):
     logger.info("Tool thread pool resized to %d workers", max_workers)
 
 logger = logging.getLogger(__name__)
+_SCRATCHPAD_RE = re.compile(
+    r"<REASONING_SCRATCHPAD>(.*?)</REASONING_SCRATCHPAD>",
+    flags=re.DOTALL,
+)
+_XML_TOOL_CALL_RE = re.compile(
+    r"<tool>\s*([A-Za-z_][A-Za-z0-9_]*)\s*</tool>\s*"
+    r"<args>\s*(\{.*?\})\s*</args>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_DSML_INVOKE_RE = re.compile(
+    r"<[^<>\s]*invoke\s+name=\"([A-Za-z_][A-Za-z0-9_]*)\"\s*>(.*?)"
+    r"</[^<>\s]*invoke>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_DSML_PARAMETER_RE = re.compile(
+    r"<[^<>\s]*parameter\s+name=\"([A-Za-z_][A-Za-z0-9_]*)\"\s+"
+    r"string=\"(true|false)\"\s*>(.*?)</[^<>\s]*parameter>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_MARKDOWN_TOOL_CALL_RE = re.compile(
+    r"\*\*Calling:\*\*\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*"
+    r"```(?:json)?\s*(\{.*?\})\s*```",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_BARE_TOOL_CALL_START_RE = re.compile(
+    r"(?m)(?:^|[\s`])([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+_INTENDED_TOOL_USE_RE = re.compile(
+    r"(?is)(\*\*Calling:\*\*|"
+    r"\b(?:i'll|i will|let me|i'm going to|i am going to)\b"
+    r".{0,160}\b(?:inspect|examine|check|look|open|read|reading|search|run|edit|patch|test|start|continue|see)\b)",
+)
 
 
 @dataclass
@@ -76,6 +109,32 @@ class AgentResult:
     reasoning_per_turn: List[Optional[str]] = field(default_factory=list)
     # Tool errors encountered during the loop
     tool_errors: List[ToolError] = field(default_factory=list)
+    # Why the loop stopped (finished, api_error, empty_response, max_turns)
+    termination_reason: Optional[str] = None
+    # API error string if the loop ended because the model call failed
+    api_error: Optional[str] = None
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert SDK/Pydantic objects to JSON-serializable primitives."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    for method in ("model_dump", "dict", "to_dict"):
+        if hasattr(value, method):
+            try:
+                return _json_safe(getattr(value, method)())
+            except Exception:
+                pass
+    if hasattr(value, "__dict__"):
+        try:
+            return _json_safe(vars(value))
+        except Exception:
+            pass
+    return str(value)
 
 
 def _extract_reasoning_from_message(message) -> Optional[str]:
@@ -116,6 +175,246 @@ def _extract_reasoning_from_message(message) -> Optional[str]:
     return None
 
 
+def _merge_reasoning_sources(*parts: Optional[str]) -> Optional[str]:
+    """Combine reasoning sources without duplicating identical blocks."""
+    merged: List[str] = []
+    seen: Set[str] = set()
+    for part in parts:
+        text = (part or "").strip()
+        if not text or text in seen:
+            continue
+        merged.append(text)
+        seen.add(text)
+    return "\n\n".join(merged) if merged else None
+
+
+def _extract_scratchpad_from_content(content: str) -> tuple[str, Optional[str]]:
+    """Remove <REASONING_SCRATCHPAD> blocks from visible content."""
+    if (
+        not content
+        or "<REASONING_SCRATCHPAD>" not in content
+        or "</REASONING_SCRATCHPAD>" not in content
+    ):
+        return content, None
+
+    scratchpads: List[str] = []
+
+    def _strip(match: re.Match[str]) -> str:
+        scratchpad = match.group(1).strip()
+        if scratchpad:
+            scratchpads.append(scratchpad)
+        return ""
+
+    visible = _SCRATCHPAD_RE.sub(_strip, content)
+    visible = re.sub(r"\n{3,}", "\n\n", visible).strip()
+    reasoning = "\n\n".join(scratchpads) if scratchpads else None
+    return visible, reasoning
+
+
+def _parse_markdown_tool_calls(content: str) -> tuple[str, Optional[List[Dict[str, Any]]]]:
+    """Parse Hermes UI-style markdown pseudo tool calls into OpenAI tool_calls."""
+    if not content or "**Calling:**" not in content:
+        return content, None
+
+    tool_calls: List[Dict[str, Any]] = []
+    first_match_start: Optional[int] = None
+    for match in _MARKDOWN_TOOL_CALL_RE.finditer(content):
+        if first_match_start is None:
+            first_match_start = match.start()
+        tool_name = match.group(1)
+        raw_arguments = match.group(2).strip()
+        try:
+            parsed_arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            continue
+        tool_calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(parsed_arguments, ensure_ascii=False),
+                },
+            }
+        )
+
+    if not tool_calls:
+        return content, None
+    visible = content[:first_match_start].strip() if first_match_start is not None else ""
+    return visible, tool_calls
+
+
+def _parse_xml_tool_calls(
+    content: str,
+    valid_tool_names: Set[str],
+) -> tuple[str, Optional[List[Dict[str, Any]]]]:
+    """Parse custom XML tool calls: <tool>name</tool><args>{...}</args>."""
+    if not content or "<tool>" not in content or "<args>" not in content:
+        return content, None
+
+    tool_calls: List[Dict[str, Any]] = []
+    first_match_start: Optional[int] = None
+    for match in _XML_TOOL_CALL_RE.finditer(content):
+        tool_name = match.group(1).strip()
+        if tool_name not in valid_tool_names:
+            continue
+        raw_arguments = match.group(2).strip()
+        try:
+            parsed_arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed_arguments, dict):
+            continue
+        if first_match_start is None:
+            first_match_start = match.start()
+        tool_calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(parsed_arguments, ensure_ascii=False),
+                },
+            }
+        )
+
+    if not tool_calls:
+        return content, None
+    visible = content[:first_match_start].strip() if first_match_start is not None else ""
+    return visible, tool_calls
+
+
+def _parse_dsml_tool_calls(
+    content: str,
+    valid_tool_names: Set[str],
+) -> tuple[str, Optional[List[Dict[str, Any]]]]:
+    """Parse DeepSeek DSML tool calls into OpenAI tool_calls."""
+    if not content or "invoke name=" not in content:
+        return content, None
+
+    tool_calls: List[Dict[str, Any]] = []
+    first_match_start: Optional[int] = None
+    visible_cut: Optional[int] = None
+    for invoke_match in _DSML_INVOKE_RE.finditer(content):
+        tool_name = invoke_match.group(1).strip()
+        if tool_name not in valid_tool_names:
+            continue
+
+        arguments: Dict[str, Any] = {}
+        valid_arguments = True
+        for param_match in _DSML_PARAMETER_RE.finditer(invoke_match.group(2)):
+            param_name = param_match.group(1).strip()
+            is_string = param_match.group(2).lower() == "true"
+            raw_value = param_match.group(3).strip()
+            if is_string:
+                arguments[param_name] = raw_value
+                continue
+            try:
+                arguments[param_name] = json.loads(raw_value)
+            except json.JSONDecodeError:
+                valid_arguments = False
+                break
+
+        if not valid_arguments:
+            continue
+        if first_match_start is None:
+            first_match_start = invoke_match.start()
+            visible_cut = first_match_start
+            tag_start = content.rfind("<", 0, first_match_start)
+            if tag_start >= 0 and "tool_calls" in content[tag_start:first_match_start]:
+                visible_cut = tag_start
+        tool_calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                },
+            }
+        )
+
+    if not tool_calls:
+        return content, None
+    visible = content[:visible_cut].strip() if visible_cut is not None else ""
+    return visible, tool_calls
+
+
+def _parse_bare_tool_calls(
+    content: str,
+    valid_tool_names: Set[str],
+) -> tuple[str, Optional[List[Dict[str, Any]]]]:
+    """Parse bare function-style pseudo calls such as read_file({"path": "..."})."""
+    if not content or not valid_tool_names:
+        return content, None
+
+    decoder = json.JSONDecoder()
+    tool_calls: List[Dict[str, Any]] = []
+    first_match_start: Optional[int] = None
+
+    for match in _BARE_TOOL_CALL_START_RE.finditer(content):
+        tool_name = match.group(1)
+        if tool_name not in valid_tool_names:
+            continue
+
+        args_start = match.end()
+        while args_start < len(content) and content[args_start].isspace():
+            args_start += 1
+        if args_start >= len(content) or content[args_start] != "{":
+            continue
+
+        try:
+            parsed_arguments, offset = decoder.raw_decode(content[args_start:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed_arguments, dict):
+            continue
+
+        close_index = args_start + offset
+        while close_index < len(content) and content[close_index].isspace():
+            close_index += 1
+        if close_index >= len(content) or content[close_index] != ")":
+            continue
+
+        if first_match_start is None:
+            first_match_start = match.start()
+        tool_calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(parsed_arguments, ensure_ascii=False),
+                },
+            }
+        )
+
+    if not tool_calls:
+        return content, None
+    visible = content[:first_match_start].strip() if first_match_start is not None else ""
+    return visible, tool_calls
+
+
+def _looks_like_intended_tool_use(content: str) -> bool:
+    """Return True when a no-tool assistant message is only promising action."""
+    return bool(content and _INTENDED_TOOL_USE_RE.search(content))
+
+
+def _tool_call_trace_dict(tc) -> Dict[str, Any]:
+    if isinstance(tc, dict):
+        fn = tc.get("function", {})
+        return {
+            "id": tc.get("id"),
+            "name": fn.get("name", tc.get("name")),
+            "arguments": fn.get("arguments", tc.get("arguments")),
+        }
+    return {
+        "id": tc.id,
+        "name": tc.function.name,
+        "arguments": tc.function.arguments,
+    }
+
+
 class HermesAgentLoop:
     """
     Runs hermes-agent's tool-calling loop using standard OpenAI-spec tool calling.
@@ -141,6 +440,11 @@ class HermesAgentLoop:
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict[str, Any]] = None,
         budget_config: Optional["BudgetConfig"] = None,
+        tool_choice: Optional[Any] = "auto",
+        send_tool_schemas: bool = True,
+        api_trace_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        request_transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        preserve_reasoning_in_history: bool = True,
     ):
         """
         Initialize the agent loop.
@@ -160,6 +464,22 @@ class HermesAgentLoop:
             budget_config: Tool result persistence budget. Controls per-tool
                         thresholds, per-turn aggregate budget, and preview size.
                         If None, uses DEFAULT_BUDGET (current hardcoded values).
+            tool_choice: OpenAI-compatible tool_choice value to send when tools
+                        are available. Defaults to "auto" so providers that
+                        require an explicit parser trigger produce structured
+                        tool_calls instead of plain text.
+            send_tool_schemas: Whether to include the OpenAI tools payload in
+                        chat requests. Disable for prompt-only/client-side tool
+                        protocols such as custom XML tool calls.
+            api_trace_callback: Optional callback invoked once per model API call
+                        with a JSON-serializable trace record.
+            request_transform: Optional callback that can rewrite the outbound
+                        chat kwargs before tracing and submission.
+            preserve_reasoning_in_history: Whether to append provider-native
+                        reasoning_content to assistant messages in chat history.
+                        Some templates use this field for prior turns, but custom
+                        reasoning endpoints may degrade if hidden reasoning is
+                        replayed verbatim.
         """
         from tools.budget_config import DEFAULT_BUDGET
         self.server = server
@@ -171,6 +491,20 @@ class HermesAgentLoop:
         self.max_tokens = max_tokens
         self.extra_body = extra_body
         self.budget_config = budget_config or DEFAULT_BUDGET
+        self.tool_choice = tool_choice
+        self.send_tool_schemas = send_tool_schemas
+        self.api_trace_callback = api_trace_callback
+        self.request_transform = request_transform
+        self.preserve_reasoning_in_history = preserve_reasoning_in_history
+
+    def _emit_api_trace(self, record: Dict[str, Any]) -> None:
+        """Best-effort callback for per-turn API trace persistence."""
+        if not self.api_trace_callback:
+            return
+        try:
+            self.api_trace_callback(record)
+        except Exception as e:
+            logger.warning("API trace callback failed for task %s: %s", self.task_id[:8], e)
 
     async def run(self, messages: List[Dict[str, Any]]) -> AgentResult:
         """
@@ -185,6 +519,7 @@ class HermesAgentLoop:
         """
         reasoning_per_turn = []
         tool_errors: List[ToolError] = []
+        no_tool_retry_count = 0
 
         # Per-loop TodoStore for the todo tool (ephemeral, dies with the loop)
         from tools.todo_tool import TodoStore, todo_tool as _todo_tool
@@ -212,8 +547,10 @@ class HermesAgentLoop:
             }
 
             # Only pass tools if we have them
-            if self.tool_schemas:
+            if self.tool_schemas and self.send_tool_schemas:
                 chat_kwargs["tools"] = self.tool_schemas
+                if self.tool_choice is not None:
+                    chat_kwargs["tool_choice"] = self.tool_choice
 
             # Only pass max_tokens if explicitly set
             if self.max_tokens is not None:
@@ -224,12 +561,50 @@ class HermesAgentLoop:
             if self.extra_body:
                 chat_kwargs["extra_body"] = self.extra_body
 
+            if self.request_transform:
+                try:
+                    transformed = self.request_transform(chat_kwargs)
+                    if transformed is not None:
+                        chat_kwargs = transformed
+                except Exception as e:
+                    logger.warning("Request transform failed on turn %d: %s", turn + 1, e)
+
+            trace_record_base = {
+                "timestamp": _time.time(),
+                "task_id": self.task_id,
+                "turn": turn + 1,
+                "model": getattr(self.server, "model_name", None),
+                "base_url": getattr(self.server, "base_url", None),
+                "request": _json_safe(chat_kwargs),
+                "tool_schema_names": [
+                    schema.get("function", {}).get("name")
+                    for schema in self.tool_schemas
+                ],
+            }
+
             # Make the API call -- standard OpenAI spec
             api_start = _time.monotonic()
             try:
                 response = await self.server.chat_completion(**chat_kwargs)
             except Exception as e:
                 api_elapsed = _time.monotonic() - api_start
+                self._emit_api_trace(
+                    {
+                        **trace_record_base,
+                        "latency_seconds": api_elapsed,
+                        "response_id": None,
+                        "response_model": None,
+                        "assistant_content": None,
+                        "reasoning": None,
+                        "tool_calls": [],
+                        "finish_reason": None,
+                        "usage": None,
+                        "error": {
+                            "type": type(e).__name__,
+                            "message": str(e),
+                        },
+                    }
+                )
                 logger.error("API call failed on turn %d (%.1fs): %s", turn + 1, api_elapsed, e)
                 return AgentResult(
                     messages=messages,
@@ -238,11 +613,30 @@ class HermesAgentLoop:
                     finished_naturally=False,
                     reasoning_per_turn=reasoning_per_turn,
                     tool_errors=tool_errors,
+                    termination_reason="api_error",
+                    api_error=str(e),
                 )
 
             api_elapsed = _time.monotonic() - api_start
 
             if not response or not response.choices:
+                self._emit_api_trace(
+                    {
+                        **trace_record_base,
+                        "latency_seconds": api_elapsed,
+                        "response_id": getattr(response, "id", None) if response else None,
+                        "response_model": getattr(response, "model", None) if response else None,
+                        "assistant_content": None,
+                        "reasoning": None,
+                        "tool_calls": [],
+                        "finish_reason": None,
+                        "usage": _json_safe(getattr(response, "usage", None)) if response else None,
+                        "error": {
+                            "type": "EmptyResponse",
+                            "message": "Response missing choices",
+                        },
+                    }
+                )
                 logger.warning("Empty response on turn %d (api=%.1fs)", turn + 1, api_elapsed)
                 return AgentResult(
                     messages=messages,
@@ -251,12 +645,23 @@ class HermesAgentLoop:
                     finished_naturally=False,
                     reasoning_per_turn=reasoning_per_turn,
                     tool_errors=tool_errors,
+                    termination_reason="empty_response",
                 )
 
             assistant_msg = response.choices[0].message
 
-            # Extract reasoning content from the response (all provider formats)
-            reasoning = _extract_reasoning_from_message(assistant_msg)
+            raw_assistant_content = assistant_msg.content or ""
+            assistant_content = raw_assistant_content
+            scratchpad_reasoning = None
+            if isinstance(raw_assistant_content, str):
+                assistant_content, scratchpad_reasoning = _extract_scratchpad_from_content(
+                    raw_assistant_content
+                )
+
+            # Extract reasoning content from the response (all provider formats),
+            # then merge any inline scratchpad reasoning for traces/metrics.
+            native_reasoning = _extract_reasoning_from_message(assistant_msg)
+            reasoning = _merge_reasoning_sources(native_reasoning, scratchpad_reasoning)
             reasoning_per_turn.append(reasoning)
 
             # Check for tool calls -- standard OpenAI spec.
@@ -288,7 +693,124 @@ class HermesAgentLoop:
                 except Exception:
                     pass  # Fall through to no tool calls
 
+            if (
+                not assistant_msg.tool_calls
+                and assistant_msg.content
+                and self.tool_schemas
+            ):
+                parsed_content, parsed_calls = _parse_dsml_tool_calls(
+                    assistant_msg.content,
+                    self.valid_tool_names,
+                )
+                if parsed_calls:
+                    assistant_msg.tool_calls = parsed_calls
+                    assistant_msg.content = parsed_content
+                    logger.debug(
+                        "DSML tool-call parser extracted %d tool calls from raw content",
+                        len(parsed_calls),
+                    )
+
+            if (
+                not assistant_msg.tool_calls
+                and assistant_msg.content
+                and self.tool_schemas
+            ):
+                parsed_content, parsed_calls = _parse_xml_tool_calls(
+                    assistant_msg.content,
+                    self.valid_tool_names,
+                )
+                if parsed_calls:
+                    assistant_msg.tool_calls = parsed_calls
+                    assistant_msg.content = parsed_content
+                    logger.debug(
+                        "XML tool-call parser extracted %d tool calls from raw content",
+                        len(parsed_calls),
+                    )
+
+            if (
+                not assistant_msg.tool_calls
+                and assistant_msg.content
+                and self.tool_schemas
+                and "**Calling:**" in (assistant_msg.content or "")
+            ):
+                parsed_content, parsed_calls = _parse_markdown_tool_calls(
+                    assistant_msg.content
+                )
+                if parsed_calls:
+                    assistant_msg.tool_calls = parsed_calls
+                    assistant_msg.content = parsed_content
+                    logger.debug(
+                        "Markdown pseudo-call parser extracted %d tool calls from raw content",
+                        len(parsed_calls),
+                    )
+
+            if (
+                not assistant_msg.tool_calls
+                and assistant_msg.content
+                and self.tool_schemas
+            ):
+                parsed_content, parsed_calls = _parse_bare_tool_calls(
+                    assistant_msg.content,
+                    self.valid_tool_names,
+                )
+                if parsed_calls:
+                    assistant_msg.tool_calls = parsed_calls
+                    assistant_msg.content = parsed_content
+                    logger.debug(
+                        "Bare pseudo-call parser extracted %d tool calls from raw content",
+                        len(parsed_calls),
+                    )
+
+            if (
+                not assistant_msg.tool_calls
+                and native_reasoning
+                and self.tool_schemas
+            ):
+                parsed_reasoning, parsed_calls = _parse_dsml_tool_calls(
+                    native_reasoning,
+                    self.valid_tool_names,
+                )
+                if parsed_calls:
+                    assistant_msg.tool_calls = parsed_calls
+                    native_reasoning = parsed_reasoning or None
+                    reasoning = _merge_reasoning_sources(
+                        native_reasoning, scratchpad_reasoning
+                    )
+                    reasoning_per_turn[-1] = reasoning
+                    logger.debug(
+                        "DSML tool-call parser extracted %d tool calls from reasoning",
+                        len(parsed_calls),
+                    )
+
+            # Preserve scratchpad-tagged content verbatim in conversation history so
+            # the next assistant turn sees the same raw format it produced.
+            history_content = raw_assistant_content if scratchpad_reasoning else (assistant_msg.content or "")
+
+            self._emit_api_trace(
+                {
+                    **trace_record_base,
+                    "latency_seconds": api_elapsed,
+                    "response_id": getattr(response, "id", None),
+                    "response_model": getattr(response, "model", None),
+                    "assistant_content": assistant_content,
+                    "assistant_content_raw": (
+                        raw_assistant_content
+                        if assistant_content != raw_assistant_content
+                        else None
+                    ),
+                    "reasoning": reasoning,
+                    "tool_calls": [
+                        _tool_call_trace_dict(tc)
+                        for tc in (assistant_msg.tool_calls or [])
+                    ],
+                    "finish_reason": getattr(response.choices[0], "finish_reason", None),
+                    "usage": _json_safe(getattr(response, "usage", None)),
+                    "error": None,
+                }
+            )
+
             if assistant_msg.tool_calls:
+                no_tool_retry_count = 0
                 # Normalize tool calls to dicts — they may come as objects
                 # (OpenAI API) or dicts (vLLM ToolCallTranslator).
                 def _tc_to_dict(tc):
@@ -313,15 +835,15 @@ class HermesAgentLoop:
                 # Build the assistant message dict for conversation history
                 msg_dict: Dict[str, Any] = {
                     "role": "assistant",
-                    "content": assistant_msg.content or "",
+                    "content": history_content,
                     "tool_calls": [_tc_to_dict(tc) for tc in assistant_msg.tool_calls],
                 }
 
                 # Preserve reasoning_content for multi-turn chat template handling
                 # (e.g., Kimi-K2's template renders <think> blocks differently
                 # for history vs. the latest turn based on this field)
-                if reasoning:
-                    msg_dict["reasoning_content"] = reasoning
+                if native_reasoning and self.preserve_reasoning_in_history:
+                    msg_dict["reasoning_content"] = native_reasoning
 
                 messages.append(msg_dict)
 
@@ -490,11 +1012,36 @@ class HermesAgentLoop:
                 # No tool calls -- model is done
                 msg_dict = {
                     "role": "assistant",
-                    "content": assistant_msg.content or "",
+                    "content": history_content,
                 }
-                if reasoning:
-                    msg_dict["reasoning_content"] = reasoning
+                if native_reasoning and self.preserve_reasoning_in_history:
+                    msg_dict["reasoning_content"] = native_reasoning
                 messages.append(msg_dict)
+
+                if (
+                    self.tool_schemas
+                    and no_tool_retry_count < 2
+                    and _looks_like_intended_tool_use(history_content)
+                ):
+                    no_tool_retry_count += 1
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "You described tool use but did not make a structured "
+                                "tool call. Make the tool call now using the available "
+                                "tools; do not write the call in prose or markdown."
+                            ),
+                        }
+                    )
+                    turn_elapsed = _time.monotonic() - turn_start
+                    logger.info(
+                        "[%s] turn %d: api=%.1fs, intended tool use without tool_calls "
+                        "(retry %d), turn_total=%.1fs",
+                        self.task_id[:8], turn + 1, api_elapsed,
+                        no_tool_retry_count, turn_elapsed,
+                    )
+                    continue
 
                 turn_elapsed = _time.monotonic() - turn_start
                 logger.info(
@@ -509,6 +1056,7 @@ class HermesAgentLoop:
                     finished_naturally=True,
                     reasoning_per_turn=reasoning_per_turn,
                     tool_errors=tool_errors,
+                    termination_reason="finished",
                 )
 
         # Hit max turns without the model stopping
@@ -520,6 +1068,7 @@ class HermesAgentLoop:
             finished_naturally=False,
             reasoning_per_turn=reasoning_per_turn,
             tool_errors=tool_errors,
+            termination_reason="max_turns",
         )
 
     def _get_managed_state(self) -> Optional[Dict[str, Any]]:
